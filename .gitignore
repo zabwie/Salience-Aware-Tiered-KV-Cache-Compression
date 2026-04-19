@@ -42,6 +42,11 @@ Thumbs.db
 # Logs
 *.log
 
+# Benchmark results (generated files)
+results/*.json
+results/*.png
+results/*.csv
+
 # Environment
 .env
 venv/

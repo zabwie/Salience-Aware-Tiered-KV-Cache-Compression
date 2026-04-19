@@ -146,12 +146,37 @@ ttkv/
 │   ├── attention_scorer.py  # Attention-guided scoring
 │   └── type_prior.py        # Structural priors
 ├── tests/
-│   ├── core/               # Core functionality tests
-│   └── experiments/        # Paper experiments
+│   ├── core/                # Core functionality tests
+│   ├── integration/         # End-to-end integration tests
+│   └── experiments/         # Paper experiments
+├── .github/
+│   └── workflows/           # CI/CD automation
 ├── paper/
-│   └── main.tex            # LaTeX source
-└── README.md               # This file
+│   └── main.tex             # LaTeX source
+├── CONTRIBUTING.md          # Contribution guidelines
+├── CHANGELOG.md             # Version history
+└── README.md                # This file
 ```
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for:
+- Development setup instructions
+- Code style guidelines (Black, Flake8, mypy)
+- Testing requirements
+- Pull request process
+
+## CI/CD
+
+This project uses GitHub Actions for continuous integration:
+
+- **Automated Testing**: Runs on every push and PR (Python 3.9-3.12)
+- **Code Quality**: Black formatting, Flake8 linting, mypy type checking
+- **Integration Tests**: Full end-to-end model integration tests
+- **Benchmarks**: Performance regression testing
+- **PyPI Publishing**: Automated on releases
+
+[![CI Status](https://github.com/zabwie/ttkv/workflows/Tests/badge.svg)](https://github.com/zabwie/ttkv/actions)
 
 ## Citation
 
