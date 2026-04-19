@@ -1,11 +1,4 @@
-"""
-Baseline KV Cache Eviction Methods for Comparison
-
-H2O: Heavy Hitter Oracle - keeps tokens with highest accumulated attention
-ScissorHands: Keeps tokens with highest attention in recent window
-
-Both use BINARY eviction (keep/drop), unlike tiered compression.
-"""
+"""Baseline KV Cache eviction methods for comparison."""
 
 import sys
 sys.path.insert(0, '../src')
@@ -20,11 +13,6 @@ from ttkv import CacheConfig
 
 
 class H2OCache:
-    """
-    H2O: Heavy Hitter Oracle
-    Keeps top-k tokens by accumulated attention score.
-    Binary eviction - tokens are either kept or permanently dropped.
-    """
     
     def __init__(self, config: CacheConfig, max_cache_size: int = 2048):
         self.config = config
@@ -38,10 +26,9 @@ class H2OCache:
         self.accumulated_attention = []  # Track attention per position
         self.total_tokens = 0
     
-    def add(self, k: torch.Tensor, v: torch.Tensor, 
-            retention: Optional[torch.Tensor] = None,
-            positions: Optional[torch.Tensor] = None):
-        """Add to cache and update accumulated attention scores."""
+    def add(self, k: torch.Tensor, v: torch.Tensor,
+           retention: Optional[torch.Tensor] = None,
+           positions: Optional[torch.Tensor] = None):
         self.k_cache.append(k)
         self.v_cache.append(v)
         
@@ -63,9 +50,8 @@ class H2OCache:
         self.total_tokens += k.size(2)
     
     def add_with_attention_pattern(self, k: torch.Tensor, v: torch.Tensor,
-                                   attention_to_needle: torch.Tensor,
-                                   positions: Optional[torch.Tensor] = None):
-        """Add with explicit attention pattern (for testing)."""
+                                  attention_to_needle: torch.Tensor,
+                                  positions: Optional[torch.Tensor] = None):
         self.k_cache.append(k)
         self.v_cache.append(v)
         
@@ -81,13 +67,11 @@ class H2OCache:
         self.total_tokens += k.size(2)
     
     def _update_accumulated_attention(self, new_attention: torch.Tensor):
-        """Update accumulated attention with EMA decay."""
         ema_decay = 0.95
         for i, attn in enumerate(self.accumulated_attention):
             self.accumulated_attention[i] = ema_decay * attn + (1 - ema_decay) * new_attention
     
     def get_cache(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get current cache (before eviction)."""
         if not self.k_cache:
             return None, None, None
         
@@ -98,10 +82,6 @@ class H2OCache:
         return k_all, v_all, pos_all
     
     def get_compressed_cache(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Evict low-attention tokens, keep top-k by accumulated attention.
-        Binary eviction - tokens are kept or dropped, no compression.
-        """
         if not self.k_cache:
             return None, None, None
         
@@ -117,9 +97,8 @@ class H2OCache:
         if total_len <= self.max_cache_size:
             return k_all, v_all, pos_all
         
-        # Binary eviction: keep top-k by attention score
         _, top_indices = torch.topk(attn_all[0], self.max_cache_size, dim=0)
-        top_indices = top_indices.sort()[0]  # Sort to maintain order
+        top_indices = top_indices.sort()[0]
         
         k_kept = k_all[:, :, top_indices, :]
         v_kept = v_all[:, :, top_indices, :]
@@ -144,11 +123,6 @@ class H2OCache:
 
 
 class ScissorHandsCache:
-    """
-    ScissorHands: Attention-based eviction with recent window focus.
-    Keeps tokens that receive highest attention from recent query positions.
-    Binary eviction - tokens outside the attention window are dropped.
-    """
     
     def __init__(self, config: CacheConfig, max_cache_size: int = 2048, 
                  attention_window: int = 256):
@@ -164,9 +138,8 @@ class ScissorHandsCache:
         self.total_tokens = 0
     
     def add(self, k: torch.Tensor, v: torch.Tensor,
-            retention: Optional[torch.Tensor] = None,
-            positions: Optional[torch.Tensor] = None):
-        """Add to cache."""
+           retention: Optional[torch.Tensor] = None,
+           positions: Optional[torch.Tensor] = None):
         self.k_cache.append(k)
         self.v_cache.append(v)
         
@@ -181,7 +154,6 @@ class ScissorHandsCache:
         self.total_tokens += k.size(2)
     
     def get_cache(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get current cache."""
         if not self.k_cache:
             return None, None, None
         
@@ -205,35 +177,19 @@ class ScissorHandsCache:
         if total_len <= self.max_cache_size:
             return k_all, v_all, pos_all
         
-        # ScissorHands: only use queries from recent window
         recent_start = max(0, total_len - self.attention_window)
         recent_positions = torch.arange(recent_start, total_len, device=device)
-        
-        # CRITICAL FIX: ScissorHands computes attention FROM recent queries TO ALL positions
-        # But tokens far away get near-zero attention due to softmax normalization
-        # over the full sequence. The slow-burn problem is real.
+
         attention_scores = torch.zeros(batch_size, total_len, device=device)
-        
+
         for q_pos in recent_positions:
             query = k_all[0, 0, q_pos, :]
-            # Attention over FULL sequence (not just window)
             scores = torch.matmul(query.unsqueeze(0), k_all[0, 0, :, :].T) / (head_dim ** 0.5)
             scores = F.softmax(scores, dim=-1)
             attention_scores += scores.squeeze(0)
-        
+
         attention_scores = attention_scores / len(recent_positions)
-        
-        # ATTENTION WINDOW LIMITATION: The slow-burn problem occurs because
-        # softmax over long contexts dilutes attention to distant tokens.
-        # A token at position 0 gets attention_score ≈ 1/15000 ≈ 0.000067
-        # which is negligible compared to nearby tokens.
-        
-        # SLOW-BURN PROBLEM: Needle at position 0 gets attention_score = 0
-        # because it's outside the recent window. It will be evicted.
-        # Note: For the slow-burn test to show the problem, the needle must have
-        # distinctive enough KV vectors that attention would attend to it.
-        # But with random filler tokens, it might still get some attention.
-        
+
         _, top_indices = torch.topk(attention_scores[0], self.max_cache_size, dim=0)
         top_indices = top_indices.sort()[0]
         
@@ -260,9 +216,6 @@ class ScissorHandsCache:
 
 
 def run_comparison(seq_len: int = 4096, tau: float = 0.9):
-    """
-    Compare all three methods on same sequence.
-    """
     print("=" * 80)
     print("KV CACHE COMPARISON: Tiered vs Binary Eviction")
     print("=" * 80)
