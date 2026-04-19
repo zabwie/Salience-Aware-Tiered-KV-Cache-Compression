@@ -57,7 +57,7 @@ viz = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"3tkv" = ["py.typed"]
+"ttkv" = ["py.typed"]
 
 [tool.black]
 line-length = 100
