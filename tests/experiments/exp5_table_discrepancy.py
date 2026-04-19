@@ -14,8 +14,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import json
-from salience_cache import CacheConfig, TieredKVCache
-from type_prior_mock import compute_type_prior_retention
+from ttkv import CacheConfig, TieredKVCache
+from ttkv import compute_type_prior_retention
 
 
 def create_test_sequence(seq_len, batch_size=1, num_heads=12, head_dim=64, seed=42):

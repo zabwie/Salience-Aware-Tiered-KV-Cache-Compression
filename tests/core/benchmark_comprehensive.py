@@ -9,8 +9,8 @@ import time
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 
-from salience_cache import CacheConfig, TieredKVCache
-from type_prior_mock import compute_type_prior_retention
+from ttkv import CacheConfig, TieredKVCache
+from ttkv import compute_type_prior_retention
 
 
 @dataclass
@@ -109,7 +109,7 @@ def measure_prefill_latency(k, v, retention, config, num_runs=10):
 
 def measure_scorer_overhead(seq_len, num_runs=100):
     """Measure overhead of computing salience scores."""
-    from salience_cache import SalienceScorer
+    from ttkv import SalienceScorer
     
     scorer = SalienceScorer(hidden_dim=768, salience_hidden=256)
     hidden_states = torch.randn(1, seq_len, 768)

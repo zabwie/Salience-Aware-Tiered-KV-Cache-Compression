@@ -22,8 +22,8 @@ from typing import Dict, List, Tuple
 from dataclasses import dataclass
 from tqdm import tqdm
 
-from salience_cache import CacheConfig, TieredKVCache, SalienceScorer
-from type_prior_mock import compute_type_prior_retention
+from ttkv import CacheConfig, TieredKVCache, SalienceScorer
+from ttkv import compute_type_prior_retention
 
 
 @dataclass

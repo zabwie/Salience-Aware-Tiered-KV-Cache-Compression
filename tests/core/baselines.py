@@ -16,7 +16,7 @@ from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 import numpy as np
 
-from salience_cache import CacheConfig
+from ttkv import CacheConfig
 
 
 class H2OCache:
@@ -269,8 +269,8 @@ def run_comparison(seq_len: int = 4096, tau: float = 0.9):
     print(f"\nTest: {seq_len} tokens, τ={tau}")
     print()
     
-    from salience_cache import TieredKVCache
-    from type_prior_mock import compute_type_prior_retention
+    from ttkv import TieredKVCache
+    from ttkv import compute_type_prior_retention
     
     # Generate test data
     batch_size = 1

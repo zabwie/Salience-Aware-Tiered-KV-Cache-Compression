@@ -163,7 +163,7 @@ class AttentionBasedKVCache:
     """
     
     def __init__(self, config, tokenizer=None):
-        from salience_cache import CacheConfig, TieredKVCache
+        from .core import CacheConfig, TieredKVCache
         
         self.config = config
         self.tokenizer = tokenizer

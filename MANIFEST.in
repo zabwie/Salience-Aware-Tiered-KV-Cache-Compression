@@ -1,0 +1,20 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+# Include type hints
+include src/3tkv/py.typed
+
+# Exclude development files
+exclude .gitignore
+exclude reproduce.sh
+
+# Exclude test and paper directories from the wheel
+prune tests
+prune paper
+prune results
+
+# Exclude compiled Python files
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude .DS_Store
