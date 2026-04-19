@@ -1,0 +1,16 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.24.0
+
+# Optional: for 4-bit quantization
+# bitsandbytes>=0.40.0
+
+# Optional: for llama.cpp models
+# llama-cpp-python>=0.2.0
+
+# For running experiments
+tqdm>=4.65.0
+
+# For visualization (tradeoff curves)
+matplotlib>=3.7.0
