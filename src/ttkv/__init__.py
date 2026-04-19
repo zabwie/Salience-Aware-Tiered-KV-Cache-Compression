@@ -1,6 +1,6 @@
 """TTKV - Three Tiered Key Value Cache Compression"""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 __author__ = "Zabdiel Pérez Muñiz"
 __license__ = "MIT"
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ttkv"
-version = "0.1.0"
+version = "1.0.0"
 description = "Salience-Aware Tiered KV Cache Compression for Long-Context Inference"
 readme = "README.md"
 license = {text = "MIT"}
@@ -13,7 +13,7 @@ authors = [
 ]
 keywords = ["kv-cache", "compression", "transformers", "llm", "memory", "attention"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
@@ -38,6 +38,8 @@ dev = [
     "pytest-cov>=4.0.0",
     "black>=23.0.0",
     "flake8>=6.0.0",
+    "mypy>=1.0.0",
+    "types-tqdm>=4.65.0",
 ]
 quantization = [
     "bitsandbytes>=0.40.0",
@@ -48,10 +50,10 @@ viz = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/zabwie/3tkv"
-"Bug Tracker" = "https://github.com/zabwie/3tkv/issues"
-"Documentation" = "https://github.com/zabwie/3tkv#readme"
-"Source" = "https://github.com/zabwie/3tkv"
+"Homepage" = "https://github.com/zabwie/ttkv"
+"Bug Tracker" = "https://github.com/zabwie/ttkv/issues"
+"Documentation" = "https://github.com/zabwie/ttkv#readme"
+"Source" = "https://github.com/zabwie/ttkv"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -68,3 +70,23 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+disallow_untyped_decorators = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+show_column_numbers = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
