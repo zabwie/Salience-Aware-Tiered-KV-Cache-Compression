@@ -6,16 +6,20 @@ and is needed MUCH LATER. This breaks binary eviction methods (H2O, ScissorHands
 but tiered compression survives via structural floor.
 """
 
-import sys
-sys.path.insert(0, '../src')
-
 import torch
 import torch.nn.functional as F
 import numpy as np
 
-from ttkv import CacheConfig, TieredKVCache
-from ttkv import compute_type_prior_retention
-from baselines import H2OCache, ScissorHandsCache
+try:
+    from ttkv import CacheConfig, TieredKVCache
+    from ttkv import compute_type_prior_retention
+    from baselines import H2OCache, ScissorHandsCache
+except ImportError:
+    import sys
+    sys.path.insert(0, '../src')
+    from ttkv import CacheConfig, TieredKVCache
+    from ttkv import compute_type_prior_retention
+    from baselines import H2OCache, ScissorHandsCache
 
 
 def create_slow_burn_context(seq_len, needle_idx=0):

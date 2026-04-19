@@ -81,7 +81,8 @@ Quality: <0.2% perplexity increase at 7.36x compression on GPT-2.
 
 - [Paper](paper/main.tex) - Full technical details
 - [API Reference](#api-reference) - Below
-- [Examples](tests/) - Test scripts and experiments
+- [Examples](examples/) - Simple demos and usage examples
+- [Tests](tests/) - Comprehensive test suite and experiments
 
 ## API Reference
 

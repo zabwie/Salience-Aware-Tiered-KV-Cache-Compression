@@ -13,16 +13,18 @@ Note: Binary methods (keep/drop) lose information permanently, while TTKV's
 tiered compression preserves information through progressive compression.
 """
 
-import sys
-sys.path.insert(0, '../src')
-
 import torch
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 import numpy as np
 
-from ttkv import CacheConfig
+try:
+    from ttkv import CacheConfig
+except ImportError:
+    import sys
+    sys.path.insert(0, '../src')
+    from ttkv import CacheConfig
 
 
 class H2OCache:
