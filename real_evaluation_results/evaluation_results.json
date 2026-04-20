@@ -1,0 +1,17 @@
+{
+  "perplexity": {
+    "baseline": {
+      "perplexity": 87.38478008612215,
+      "avg_loss": 4.470321126606153,
+      "total_tokens": 46
+    },
+    "with_compression": {
+      "perplexity": 86.79122845227772,
+      "avg_loss": 4.463505561862673,
+      "avg_compression_ratio": 0.0,
+      "total_tokens": 42
+    },
+    "degradation": -0.5935516338444273,
+    "degradation_pct": -0.6792391458323199
+  }
+}

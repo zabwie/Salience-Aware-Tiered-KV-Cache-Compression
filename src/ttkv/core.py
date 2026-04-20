@@ -102,7 +102,7 @@ class CacheConfig:
     quantization_bits: Optional[int] = None
     quantization_group_size: int = 128
     max_cache_size: int = 8192
-    dynamic_tiers: bool = True
+    dynamic_tiers: bool = False
 
     def __post_init__(self) -> None:
         if self.hidden_dim <= 0:
