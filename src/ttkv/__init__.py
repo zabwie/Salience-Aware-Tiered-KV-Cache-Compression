@@ -25,6 +25,17 @@ from .type_prior import (
     compute_type_prior_retention,
 )
 
+from .ner_classifier import (
+    NERClassifier,
+    TokenClassifier,
+)
+
+from .trainer import (
+    AttentionDataset,
+    SalienceTrainer,
+    train_on_gpt2,
+)
+
 from .exceptions import (
     TTKVError,
     ValidationError,
@@ -40,22 +51,23 @@ from .exceptions import (
 )
 
 __all__ = [
-    # Core components
     "CacheConfig",
     "CacheStats",
     "SalienceScorer",
     "RetentionScheduler",
     "TieredKVCache",
-    # Attention-guided components
     "AttentionGuidedScorer",
     "AttentionBasedKVCache",
     "AttentionGuidedWrapper",
     "extract_attention_weights",
-    # Type prior components
     "MockTypePriorClassifier",
     "create_mock_retention",
     "compute_type_prior_retention",
-    # Exceptions
+    "NERClassifier",
+    "TokenClassifier",
+    "AttentionDataset",
+    "SalienceTrainer",
+    "train_on_gpt2",
     "TTKVError",
     "ValidationError",
     "DeviceMismatchError",
