@@ -6,6 +6,7 @@ __license__ = "MIT"
 
 from .core import (
     CacheConfig,
+    CacheStats,
     SalienceScorer,
     RetentionScheduler,
     TieredKVCache,
@@ -41,6 +42,7 @@ from .exceptions import (
 __all__ = [
     # Core components
     "CacheConfig",
+    "CacheStats",
     "SalienceScorer",
     "RetentionScheduler",
     "TieredKVCache",

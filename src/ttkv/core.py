@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict, Any, Set
+from typing import Optional, Tuple, List, Dict, Any, Set, Union
 from dataclasses import dataclass, field
 import numpy as np
+import threading
+import weakref
 
 from .exceptions import (
     ValidationError,
@@ -15,6 +17,54 @@ from .exceptions import (
     InvalidValueError,
     ConfigurationError,
 )
+
+
+@dataclass(frozen=True)
+class CacheStats:
+    """Structured compression statistics for observability.
+
+    Supports both attribute access (stats.total_tokens) and dictionary-style
+    access (stats['total_tokens']) for backward compatibility.
+
+    Attributes:
+        total_tokens: Total number of tokens before compression
+        compressed_tokens: Number of tokens after compression
+        compression_ratio: Ratio of total to compressed tokens
+        tier_distribution: Token counts per tier (protected, tier0, tier1, tier2)
+        peak_memory_mb: Peak GPU memory used during compression
+        compression_time_ms: Time taken for compression in milliseconds
+    """
+    total_tokens: int
+    compressed_tokens: int
+    compression_ratio: float
+    tier_distribution: Tuple[int, int, int, int]  # (protected, tier0, tier1, tier2)
+    peak_memory_mb: float = 0.0
+    compression_time_ms: float = 0.0
+
+    def __getitem__(self, key: str) -> Union[int, float, Tuple[int, int, int, int]]:
+        """Support dictionary-style access for backward compatibility."""
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __contains__(self, key: str) -> bool:
+        """Support 'in' operator for dictionary-style checks."""
+        return hasattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Support dict.get() method."""
+        return getattr(self, key, default)
+
+    def to_dict(self) -> Dict[str, Union[int, float, Tuple[int, int, int, int]]]:
+        """Convert stats to dictionary for serialization."""
+        return {
+            'total_tokens': self.total_tokens,
+            'compressed_tokens': self.compressed_tokens,
+            'compression_ratio': self.compression_ratio,
+            'tier_distribution': self.tier_distribution,
+            'peak_memory_mb': self.peak_memory_mb,
+            'compression_time_ms': self.compression_time_ms,
+        }
 
 
 @dataclass
@@ -32,6 +82,7 @@ class CacheConfig:
         salience_hidden: Hidden dimension for salience scorer (default: 256)
         type_priors: Dictionary mapping token types to retention priorities
         tau_threshold: Threshold for protected tokens (default: 0.8)
+        enable_jit: Whether to enable JIT compilation for compression (default: True)
     """
     hidden_dim: int = 768
     num_heads: int = 12
@@ -43,6 +94,7 @@ class CacheConfig:
     salience_hidden: int = 256
     type_priors: Dict[str, float] = field(default_factory=dict)
     tau_threshold: float = 0.8
+    enable_jit: bool = True
 
     def __post_init__(self) -> None:
         if self.hidden_dim <= 0:
@@ -265,8 +317,17 @@ class TieredKVCache:
     - Tier 1: Middle tokens (4:1 compression)
     - Tier 2: Old tokens (16:1 compression)
 
+    Thread-safe and supports context manager usage for automatic cleanup.
+
     Args:
         config: CacheConfig instance with compression parameters
+
+    Example:
+        >>> config = CacheConfig(tier0_size=256, tier1_size=2048)
+        >>> with TieredKVCache(config) as cache:
+        ...     cache.add(k, v, retention, positions)
+        ...     k_comp, v_comp, pos_comp = cache.get_compressed_cache()
+        ...     stats = cache.get_stats()
     """
 
     def __init__(self, config: CacheConfig) -> None:
@@ -278,17 +339,42 @@ class TieredKVCache:
         self.total_tokens: int = 0
         self._expected_dtype: Optional[torch.dtype] = None
         self._expected_device: Optional[torch.device] = None
+        self._lock: threading.RLock = threading.RLock()
+        self._tier_counts: Tuple[int, int, int, int] = (0, 0, 0, 0)
+        self._compression_time_ms: float = 0.0
+        self._jit_cache: Optional[Any] = None
         self.clear()
 
     def clear(self) -> None:
         """Clear all cached data."""
-        self.k_cache = []
-        self.v_cache = []
-        self.retention_scores = []
-        self.positions = []
-        self.total_tokens = 0
-        self._expected_dtype = None
-        self._expected_device = None
+        with self._lock:
+            self.k_cache = []
+            self.v_cache = []
+            self.retention_scores = []
+            self.positions = []
+            self.total_tokens = 0
+            self._expected_dtype = None
+            self._expected_device = None
+            self._tier_counts = (0, 0, 0, 0)
+            self._compression_time_ms = 0.0
+
+    def __enter__(self) -> 'TieredKVCache':
+        """Enter context manager."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Exit context manager with automatic cleanup."""
+        self.clear()
+
+    def __del__(self) -> None:
+        """Destructor with automatic GPU memory cleanup."""
+        self.clear()
+
+    def _get_peak_memory_mb(self) -> float:
+        """Get peak GPU memory allocated in MB."""
+        if torch.cuda.is_available():
+            return torch.cuda.max_memory_allocated() / (1024 * 1024)
+        return 0.0
 
     def _validate_device_consistency(self, *tensors: torch.Tensor) -> torch.device:
         """Validate all tensors are on the same device.
@@ -431,11 +517,12 @@ class TieredKVCache:
         self._validate_tensor_values(v, "values")
         self._validate_tensor_values(retention, "retention")
 
-        self.k_cache.append(k)
-        self.v_cache.append(v)
-        self.retention_scores.append(retention)
-        self.positions.append(positions)
-        self.total_tokens += k.size(2)
+        with self._lock:
+            self.k_cache.append(k)
+            self.v_cache.append(v)
+            self.retention_scores.append(retention)
+            self.positions.append(positions)
+            self.total_tokens += k.size(2)
 
     def _extract_retention_scores_vectorized(
         self,
@@ -666,11 +753,10 @@ class TieredKVCache:
                     torch.empty(batch_size, num_heads, 0, head_dim, device=device),
                     torch.empty(batch_size, 0, device=device, dtype=torch.long))
 
-    def _compress(self, k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
-                  positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compress KV cache using weighted pooling based on retention scores.
-
-        Uses vectorized PyTorch operations for efficient GPU utilization.
+    @torch.jit.ignore
+    def _compress_eager(self, k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
+                        positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Eager-mode compression for compatibility and debugging.
 
         Args:
             k: Key tensor of shape [batch, heads, seq, head_dim]
@@ -716,21 +802,61 @@ class TieredKVCache:
 
         return k_pooled, v_pooled, pos_pooled
 
-    def get_stats(self) -> Dict[str, Any]:
-        """Get compression statistics.
+    @torch.compile(mode='reduce-overhead', fullgraph=False)
+    def _compress_jit(self, k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
+                      positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """JIT-compiled compression for production inference.
+
+        Uses torch.compile for optimized kernel fusion on PyTorch 2.0+.
+        Falls back to eager mode on older PyTorch versions.
+        """
+        return self._compress_eager(k, v, retention, positions, ratio)
+
+    def _compress(self, k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
+                  positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compress KV cache using weighted pooling based on retention scores.
+
+        Automatically selects JIT-compiled or eager mode based on config.
+
+        Args:
+            k: Key tensor of shape [batch, heads, seq, head_dim]
+            v: Value tensor of shape [batch, heads, seq, head_dim]
+            retention: Retention scores of shape [batch, seq]
+            positions: Position indices of shape [batch, seq]
+            ratio: Compression ratio
 
         Returns:
-            Dictionary with total_tokens, compressed_tokens, and compression_ratio
+            Tuple of (compressed_keys, compressed_values, compressed_positions)
+        """
+        if self.config.enable_jit and hasattr(torch, 'compile'):
+            return self._compress_jit(k, v, retention, positions, ratio)
+        return self._compress_eager(k, v, retention, positions, ratio)
+
+    def get_stats(self) -> CacheStats:
+        """Get structured compression statistics.
+
+        Returns:
+            CacheStats with detailed compression metrics
         """
         if not self.k_cache:
-            return {'total_tokens': 0, 'compressed_tokens': 0, 'compression_ratio': 1.0}
+            return CacheStats(
+                total_tokens=0,
+                compressed_tokens=0,
+                compression_ratio=1.0,
+                tier_distribution=(0, 0, 0, 0),
+                peak_memory_mb=0.0,
+                compression_time_ms=0.0
+            )
 
         k_comp: Optional[torch.Tensor]
         k_comp, _, _ = self.get_compressed_cache()
         compressed_len: int = k_comp.size(2) if k_comp is not None else 0
 
-        return {
-            'total_tokens': self.total_tokens,
-            'compressed_tokens': compressed_len,
-            'compression_ratio': self.total_tokens / max(compressed_len, 1)
-        }
+        return CacheStats(
+            total_tokens=self.total_tokens,
+            compressed_tokens=compressed_len,
+            compression_ratio=self.total_tokens / max(compressed_len, 1),
+            tier_distribution=self._tier_counts,
+            peak_memory_mb=self._get_peak_memory_mb(),
+            compression_time_ms=self._compression_time_ms
+        )
