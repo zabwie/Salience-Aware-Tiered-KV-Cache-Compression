@@ -367,8 +367,11 @@ class TieredKVCache:
         self.clear()
 
     def __del__(self) -> None:
-        """Destructor with automatic GPU memory cleanup."""
+        """Destructor with automatic GPU memory cleanup and synchronization."""
         self.clear()
+        # Force CUDA synchronization to ensure cleanup completes before object destruction
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def _get_peak_memory_mb(self) -> float:
         """Get peak GPU memory allocated in MB."""
@@ -694,6 +697,12 @@ class TieredKVCache:
         v_tiers: List[torch.Tensor] = []
         pos_tiers: List[torch.Tensor] = []
 
+        # Track token counts per tier
+        protected_count = 0
+        tier0_count = 0
+        tier1_count = 0
+        tier2_count = 0
+
         # Process protected tier (no compression)
         if protected_mask.any():
             k_prot, v_prot, pos_prot = self._extract_masked_batch_vectorized(
@@ -703,6 +712,7 @@ class TieredKVCache:
                 k_tiers.append(k_prot)
                 v_tiers.append(v_prot)
                 pos_tiers.append(pos_prot)
+                protected_count = k_prot.size(2)
 
         # Process tier 0 - recent tokens (no compression)
         if recent_mask.any():
@@ -713,6 +723,7 @@ class TieredKVCache:
                 k_tiers.append(k_rec)
                 v_tiers.append(v_rec)
                 pos_tiers.append(pos_rec)
+                tier0_count = k_rec.size(2)
 
         # Process tier 1 - middle tokens (tier1_compression:1 compression)
         if middle_mask.any():
@@ -723,6 +734,7 @@ class TieredKVCache:
                 ret_mid = self._extract_retention_scores_vectorized(
                     retention_all, middle_mask, k_mid
                 )
+                tier1_count = k_mid.size(2)  # Before compression
                 k_comp, v_comp, pos_comp = self._compress(
                     k_mid, v_mid, ret_mid, pos_mid, self.config.tier1_compression
                 )
@@ -739,12 +751,16 @@ class TieredKVCache:
                 ret_old = self._extract_retention_scores_vectorized(
                     retention_all, old_mask, k_old
                 )
+                tier2_count = k_old.size(2)  # Before compression
                 k_comp, v_comp, pos_comp = self._compress(
                     k_old, v_old, ret_old, pos_old, self.config.tier2_compression
                 )
                 k_tiers.append(k_comp)
                 v_tiers.append(v_comp)
                 pos_tiers.append(pos_comp)
+
+        # Store tier counts for observability
+        self._tier_counts = (protected_count, tier0_count, tier1_count, tier2_count)
 
         if k_tiers:
             return torch.cat(k_tiers, dim=2), torch.cat(v_tiers, dim=2), torch.cat(pos_tiers, dim=1)
