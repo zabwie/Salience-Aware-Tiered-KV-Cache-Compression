@@ -18,23 +18,47 @@ from .exceptions import (
 
 
 class ScoreAggregator:
-    """Aggregates scores using EMA and manages position-based scores."""
+    """Aggregates scores using EMA with tensor-based storage for GPU acceleration."""
 
-    def __init__(self, ema_decay: float = 0.95) -> None:
+    def __init__(self, ema_decay: float = 0.95, max_seq_len: int = 32768) -> None:
         self.ema_decay: float = ema_decay
-        self.position_importance: Dict[int, float] = {}
-        self.seen_positions: set = set()
+        self.max_seq_len: int = max_seq_len
+        self._scores: Optional[torch.Tensor] = None
+        self._mask: Optional[torch.Tensor] = None
+        self._device: Optional[torch.device] = None
+
+    def _ensure_initialized(self, seq_len: int, device: torch.device) -> None:
+        """Ensure tensor storage is initialized and can accommodate seq_len."""
+        actual_len = min(seq_len, self.max_seq_len)
+
+        if self._scores is None or self._scores.size(0) < actual_len:
+            # Reallocate with larger capacity
+            new_scores = torch.zeros(actual_len, device=device)
+            new_mask = torch.zeros(actual_len, dtype=torch.bool, device=device)
+
+            if self._scores is not None:
+                # Copy existing data
+                copy_len = min(self._scores.size(0), actual_len)
+                new_scores[:copy_len] = self._scores[:copy_len]
+                new_mask[:copy_len] = self._mask[:copy_len]
+
+            self._scores = new_scores
+            self._mask = new_mask
+            self._device = device
 
     def update(self, position: int, value: float) -> None:
         """Update score for a position using EMA."""
-        if position in self.position_importance:
-            self.position_importance[position] = (
-                self.ema_decay * self.position_importance[position] +
+        if position >= self.max_seq_len or self._scores is None:
+            return
+
+        if self._mask[position]:
+            self._scores[position] = (
+                self.ema_decay * self._scores[position] +
                 (1 - self.ema_decay) * value
             )
         else:
-            self.position_importance[position] = value
-            self.seen_positions.add(position)
+            self._scores[position] = value
+            self._mask[position] = True
 
     def update_all(self, values: torch.Tensor) -> None:
         """Update scores for all positions using EMA (vectorized).
@@ -43,21 +67,46 @@ class ScoreAggregator:
             values: Tensor of attention values of shape [seq_len]
         """
         seq_len: int = values.size(0)
+        device: torch.device = values.device
 
-        for pos in range(seq_len):
-            attn_val: float = float(values[pos])
-            if pos in self.position_importance:
-                self.position_importance[pos] = (
-                    self.ema_decay * self.position_importance[pos] +
-                    (1 - self.ema_decay) * attn_val
-                )
-            else:
-                self.position_importance[pos] = attn_val
-                self.seen_positions.add(pos)
+        self._ensure_initialized(seq_len, device)
+
+        positions = torch.arange(seq_len, device=device)
+        existing_mask = self._mask[positions]
+
+        # Vectorized EMA update: new = decay * old + (1-decay) * new
+        old_scores = self._scores[positions]
+        new_scores = torch.where(
+            existing_mask,
+            self.ema_decay * old_scores + (1 - self.ema_decay) * values,
+            values
+        )
+
+        self._scores[positions] = new_scores
+        self._mask[positions] = True
 
     def get(self, position: int, default: float = 0.0) -> float:
         """Get score for a position."""
-        return self.position_importance.get(position, default)
+        if (self._scores is None or position >= self._scores.size(0) or
+            not self._mask[position]):
+            return default
+        return float(self._scores[position])
+
+    @property
+    def position_importance(self) -> Dict[int, float]:
+        """Backward compatibility: expose as dict interface."""
+        if self._scores is None:
+            return {}
+
+        mask_cpu = self._mask.cpu().numpy()
+        scores_cpu = self._scores.cpu().numpy()
+
+        result = {}
+        for pos in range(self._scores.size(0)):
+            if mask_cpu[pos]:
+                result[pos] = float(scores_cpu[pos])
+
+        return result
 
     def get_all_scores(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Get all position scores as a tensor.
@@ -69,41 +118,36 @@ class ScoreAggregator:
         Returns:
             Tensor of shape [seq_len] with scores for each position
         """
-        scores: torch.Tensor = torch.zeros(seq_len, device=device)
+        self._ensure_initialized(seq_len, device)
 
-        if not self.position_importance:
-            return scores
+        scores = torch.zeros(seq_len, device=device)
+        valid_len = min(seq_len, self._scores.size(0))
 
-        # Extract positions and values from dict for vectorized operations
-        positions: List[int] = []
-        values: List[float] = []
-        for pos, val in self.position_importance.items():
-            if pos < seq_len:
-                positions.append(pos)
-                values.append(val)
-
-        if positions:
-            pos_tensor: torch.Tensor = torch.tensor(positions, device=device, dtype=torch.long)
-            val_tensor: torch.Tensor = torch.tensor(values, device=device, dtype=torch.float32)
-            scores.index_put_((pos_tensor,), val_tensor, accumulate=False)
+        valid_positions = self._mask[:valid_len]
+        if valid_positions.any():
+            scores[:valid_len] = torch.where(
+                valid_positions,
+                self._scores[:valid_len],
+                torch.zeros_like(self._scores[:valid_len])
+            )
 
         return scores
 
     def decay_positions(self, current_seq_len: int) -> None:
         """Remove positions beyond current sequence length."""
-        positions_to_remove: Set[int] = {
-            pos for pos in self.position_importance.keys()
-            if pos >= current_seq_len
-        }
+        if self._mask is None:
+            return
 
-        for pos in positions_to_remove:
-            del self.position_importance[pos]
-            self.seen_positions.discard(pos)
+        # Zero out positions beyond current sequence length
+        mask_to_clear = torch.arange(self._mask.size(0), device=self._mask.device) >= current_seq_len
+        self._mask = self._mask & ~mask_to_clear
+        self._scores = torch.where(self._mask, self._scores, torch.zeros_like(self._scores))
 
     def reset(self) -> None:
         """Reset all tracked scores."""
-        self.position_importance.clear()
-        self.seen_positions.clear()
+        self._scores = None
+        self._mask = None
+        self._device = None
 
 
 class StructuralScorer:

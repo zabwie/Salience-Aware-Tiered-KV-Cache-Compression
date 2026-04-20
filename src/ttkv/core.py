@@ -83,6 +83,8 @@ class CacheConfig:
         type_priors: Dictionary mapping token types to retention priorities
         tau_threshold: Threshold for protected tokens (default: 0.8)
         enable_jit: Whether to enable JIT compilation for compression (default: True)
+        quantization_bits: Quantization bits for KV cache (None, 4, or 8) (default: None)
+        max_cache_size: Maximum cache size in tokens before forced compression (default: 8192)
     """
     hidden_dim: int = 768
     num_heads: int = 12
@@ -95,6 +97,8 @@ class CacheConfig:
     type_priors: Dict[str, float] = field(default_factory=dict)
     tau_threshold: float = 0.8
     enable_jit: bool = True
+    quantization_bits: Optional[int] = None
+    max_cache_size: int = 8192
 
     def __post_init__(self) -> None:
         if self.hidden_dim <= 0:
@@ -139,6 +143,16 @@ class CacheConfig:
                 'PUNCTUATION': 0.0,
                 'OTHER': 0.5,
             }
+        if self.quantization_bits is not None and self.quantization_bits not in (4, 8):
+            raise ConfigurationError(
+                f"quantization_bits must be None, 4, or 8, got {self.quantization_bits}",
+                "quantization_bits"
+            )
+        if self.max_cache_size < self.tier1_size:
+            raise ConfigurationError(
+                f"max_cache_size ({self.max_cache_size}) must be >= tier1_size ({self.tier1_size})",
+                "max_cache_size"
+            )
 
 
 class SalienceScorer(nn.Module):
@@ -539,6 +553,9 @@ class TieredKVCache:
             self.positions.append(positions)
             self.total_tokens += k.size(2)
 
+        if self.total_tokens > self.config.max_cache_size:
+            self._maybe_compress_oldest_tier()
+
     def _extract_retention_scores_vectorized(
         self,
         retention_all: torch.Tensor,
@@ -551,7 +568,7 @@ class TieredKVCache:
             retention_all: Retention scores [batch, seq]
             mask: Boolean mask [batch, seq]
             k_extracted: Extracted keys [batch, heads, extracted_seq, head_dim]
-                used to determine target sequence length
+            used to determine target sequence length
 
         Returns:
             Extracted retention scores [batch, extracted_seq]
@@ -562,12 +579,25 @@ class TieredKVCache:
 
         ret_out = torch.zeros(batch_size, target_len, device=device, dtype=retention_all.dtype)
 
-        for b in range(batch_size):
-            batch_mask = mask[b]
-            if batch_mask.any():
-                batch_indices = batch_mask.nonzero(as_tuple=True)[0]
-                n_masked = len(batch_indices)
-                ret_out[b, :n_masked] = retention_all[b, batch_indices]
+        if not mask.any():
+            return ret_out
+
+        # Get all masked positions across all batches at once
+        batch_indices, seq_indices = mask.nonzero(as_tuple=True)  # Both [total_masked]
+
+        if len(batch_indices) == 0:
+            return ret_out
+
+        # Gather retention scores for masked positions
+        gathered = retention_all[batch_indices, seq_indices]  # [total_masked]
+
+        # Compute output positions within each batch using cumsum
+        mask_int = mask.long()
+        output_pos = mask_int.cumsum(dim=1) - 1  # [batch, seq], 0-indexed
+        output_indices = output_pos[batch_indices, seq_indices]  # [total_masked]
+
+        # Scatter to output tensor using advanced indexing
+        ret_out[batch_indices, output_indices] = gathered
 
         return ret_out
 
@@ -911,8 +941,94 @@ class TieredKVCache:
             Tuple of (compressed_keys, compressed_values, compressed_positions)
         """
         if self.config.enable_jit and hasattr(torch, 'compile'):
-            return self._compress_jit(k, v, retention, positions, ratio)
-        return self._compress_eager(k, v, retention, positions, ratio)
+            result = self._compress_jit(k, v, retention, positions, ratio)
+        else:
+            result = self._compress_eager(k, v, retention, positions, ratio)
+
+        # Apply quantization if configured
+        if self.config.quantization_bits is not None:
+            k_q = self._quantize(result[0], self.config.quantization_bits)
+            v_q = self._quantize(result[1], self.config.quantization_bits)
+            return k_q, v_q, result[2]
+
+        return result
+
+    def _quantize(self, tensor: torch.Tensor, bits: int) -> torch.Tensor:
+        """Quantize tensor to specified bits (4 or 8).
+
+        Uses absmax quantization: scale = max(abs(tensor)),
+        quantized = round(tensor / scale * max_val).
+
+        Args:
+            tensor: Input tensor to quantize
+            bits: Number of bits (4 or 8)
+
+        Returns:
+            Quantized tensor (stored as original dtype but with quantized values)
+        """
+        if bits not in (4, 8):
+            raise ConfigurationError(f"quantization_bits must be 4 or 8, got {bits}")
+
+        max_val = 2 ** (bits - 1) - 1
+
+        # Compute scale per head per batch
+        scale = tensor.abs().max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
+        scale = torch.clamp(scale, min=1e-8)
+
+        # Quantize
+        quantized = torch.round(tensor / scale * max_val)
+        quantized = torch.clamp(quantized, -max_val - 1, max_val)
+
+        # Dequantize back to original range
+        dequantized = quantized / max_val * scale
+
+        return dequantized
+
+    def _maybe_compress_oldest_tier(self) -> bool:
+        """Compress oldest tier if cache exceeds max size.
+
+        Returns:
+            True if compression was performed
+        """
+        if self.total_tokens <= self.config.max_cache_size:
+            return False
+
+        if not self.k_cache:
+            return False
+
+        # Compress the oldest entries to make room
+        # Keep only the most recent max_cache_size tokens
+        tokens_to_remove = self.total_tokens - self.config.max_cache_size
+
+        if tokens_to_remove <= 0:
+            return False
+
+        # Remove oldest entries from the cache lists
+        with self._lock:
+            removed = 0
+            while removed < tokens_to_remove and self.k_cache:
+                first_k = self.k_cache[0]
+                tokens_in_first = first_k.size(2)
+
+                if removed + tokens_in_first <= tokens_to_remove:
+                    # Remove entire first entry
+                    self.k_cache.pop(0)
+                    self.v_cache.pop(0)
+                    self.retention_scores.pop(0)
+                    self.positions.pop(0)
+                    removed += tokens_in_first
+                    self.total_tokens -= tokens_in_first
+                else:
+                    # Partial removal from first entry
+                    keep_tokens = tokens_in_first - (tokens_to_remove - removed)
+                    self.k_cache[0] = first_k[:, :, -keep_tokens:, :]
+                    self.v_cache[0] = self.v_cache[0][:, :, -keep_tokens:, :]
+                    self.retention_scores[0] = self.retention_scores[0][:, -keep_tokens:]
+                    self.positions[0] = self.positions[0][:, -keep_tokens:]
+                    self.total_tokens -= (tokens_to_remove - removed)
+                    removed = tokens_to_remove
+
+        return True
 
     def get_stats(self) -> CacheStats:
         """Get structured compression statistics.
