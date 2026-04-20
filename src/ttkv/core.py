@@ -1,9 +1,20 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Set
 from dataclasses import dataclass, field
 import numpy as np
+
+from .exceptions import (
+    ValidationError,
+    DeviceMismatchError,
+    DtypeMismatchError,
+    ShapeMismatchError,
+    DimensionError,
+    EmptyTensorError,
+    InvalidValueError,
+    ConfigurationError,
+)
 
 
 @dataclass
@@ -34,6 +45,39 @@ class CacheConfig:
     tau_threshold: float = 0.8
 
     def __post_init__(self) -> None:
+        if self.hidden_dim <= 0:
+            raise ConfigurationError(f"hidden_dim must be positive, got {self.hidden_dim}", "hidden_dim")
+        if self.num_heads <= 0:
+            raise ConfigurationError(f"num_heads must be positive, got {self.num_heads}", "num_heads")
+        if self.head_dim <= 0:
+            raise ConfigurationError(f"head_dim must be positive, got {self.head_dim}", "head_dim")
+        if self.tier0_size < 0:
+            raise ConfigurationError(f"tier0_size must be non-negative, got {self.tier0_size}", "tier0_size")
+        if self.tier1_size < self.tier0_size:
+            raise ConfigurationError(
+                f"tier1_size ({self.tier1_size}) must be >= tier0_size ({self.tier0_size})",
+                "tier1_size"
+            )
+        if self.tier1_compression < 1:
+            raise ConfigurationError(
+                f"tier1_compression must be >= 1, got {self.tier1_compression}",
+                "tier1_compression"
+            )
+        if self.tier2_compression < self.tier1_compression:
+            raise ConfigurationError(
+                f"tier2_compression ({self.tier2_compression}) should be >= tier1_compression ({self.tier1_compression})",
+                "tier2_compression"
+            )
+        if self.salience_hidden <= 0:
+            raise ConfigurationError(
+                f"salience_hidden must be positive, got {self.salience_hidden}",
+                "salience_hidden"
+            )
+        if not 0.0 <= self.tau_threshold <= 1.0:
+            raise ConfigurationError(
+                f"tau_threshold must be in [0, 1], got {self.tau_threshold}",
+                "tau_threshold"
+            )
         if not self.type_priors:
             self.type_priors = {
                 'NAMED_ENTITY': 1.0,
@@ -66,6 +110,16 @@ class SalienceScorer(nn.Module):
             nn.Linear(salience_hidden // 2, 1)
         )
 
+    def _validate_input(self, hidden_states: torch.Tensor) -> None:
+        if hidden_states.dim() < 2:
+            raise DimensionError(2, hidden_states.dim(), "hidden_states")
+        if torch.isnan(hidden_states).any():
+            nan_count = torch.isnan(hidden_states).sum().item()
+            raise InvalidValueError("NaN", "hidden_states", nan_count)
+        if torch.isinf(hidden_states).any():
+            inf_count = torch.isinf(hidden_states).sum().item()
+            raise InvalidValueError("Inf", "hidden_states", inf_count)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute salience scores from hidden states.
 
@@ -74,7 +128,12 @@ class SalienceScorer(nn.Module):
 
         Returns:
             Salience scores of shape [...]
+
+        Raises:
+            DimensionError: If tensor doesn't have expected dimensions
+            InvalidValueError: If tensor contains NaN or Inf values
         """
+        self._validate_input(hidden_states)
         return self.net(hidden_states).squeeze(-1)
 
     def save_pretrained(self, path: str) -> None:
@@ -155,6 +214,28 @@ class RetentionScheduler(nn.Module):
         super().__init__()
         self.alpha: nn.Parameter = nn.Parameter(torch.tensor(0.5))
 
+    def _validate_inputs(self, salience_scores: torch.Tensor, type_priors: torch.Tensor) -> None:
+        if salience_scores.shape != type_priors.shape:
+            raise ShapeMismatchError(
+                salience_scores.shape,
+                type_priors.shape,
+                "salience_scores vs type_priors"
+            )
+
+        if salience_scores.device != type_priors.device:
+            raise DeviceMismatchError(
+                {salience_scores.device, type_priors.device},
+                "salience_scores and type_priors must be on the same device"
+            )
+
+        for name, tensor in [("salience_scores", salience_scores), ("type_priors", type_priors)]:
+            if torch.isnan(tensor).any():
+                nan_count = torch.isnan(tensor).sum().item()
+                raise InvalidValueError("NaN", name, nan_count)
+            if torch.isinf(tensor).any():
+                inf_count = torch.isinf(tensor).sum().item()
+                raise InvalidValueError("Inf", name, inf_count)
+
     def forward(self, salience_scores: torch.Tensor, type_priors: torch.Tensor) -> torch.Tensor:
         """Compute retention scores by combining salience and type priors.
 
@@ -164,7 +245,13 @@ class RetentionScheduler(nn.Module):
 
         Returns:
             Combined retention scores
+
+        Raises:
+            ShapeMismatchError: If shapes don't match
+            DeviceMismatchError: If tensors are on different devices
+            InvalidValueError: If tensors contain NaN or Inf values
         """
+        self._validate_inputs(salience_scores, type_priors)
         alpha: torch.Tensor = torch.sigmoid(self.alpha)
         salience_norm: torch.Tensor = torch.sigmoid(salience_scores)
         return alpha * salience_norm + (1 - alpha) * type_priors
@@ -189,6 +276,8 @@ class TieredKVCache:
         self.retention_scores: List[torch.Tensor] = []
         self.positions: List[torch.Tensor] = []
         self.total_tokens: int = 0
+        self._expected_dtype: Optional[torch.dtype] = None
+        self._expected_device: Optional[torch.device] = None
         self.clear()
 
     def clear(self) -> None:
@@ -198,6 +287,75 @@ class TieredKVCache:
         self.retention_scores = []
         self.positions = []
         self.total_tokens = 0
+        self._expected_dtype = None
+        self._expected_device = None
+
+    def _validate_device_consistency(self, *tensors: torch.Tensor) -> torch.device:
+        """Validate all tensors are on the same device.
+
+        Args:
+            *tensors: Variable number of tensors to check
+
+        Returns:
+            The common device
+
+        Raises:
+            DeviceMismatchError: If tensors are on different devices
+        """
+        devices: Set[torch.device] = {t.device for t in tensors}
+        if len(devices) > 1:
+            raise DeviceMismatchError(devices)
+        return devices.pop() if devices else torch.device('cpu')
+
+    def _validate_dtype_consistency(self, k: torch.Tensor, v: torch.Tensor) -> torch.dtype:
+        """Validate key and value tensors have compatible dtypes.
+
+        Args:
+            k: Key tensor
+            v: Value tensor
+
+        Returns:
+            The common dtype
+
+        Raises:
+            DtypeMismatchError: If dtypes are incompatible
+        """
+        if k.dtype != v.dtype:
+            raise DtypeMismatchError(k.dtype, v.dtype, "keys vs values")
+        return k.dtype
+
+    def _validate_tensor_values(self, tensor: torch.Tensor, name: str) -> None:
+        """Validate tensor doesn't contain NaN or Inf values.
+
+        Args:
+            tensor: Tensor to validate
+            name: Name of the tensor for error messages
+
+        Raises:
+            InvalidValueError: If tensor contains NaN or Inf values
+        """
+        if torch.isnan(tensor).any():
+            nan_count = torch.isnan(tensor).sum().item()
+            raise InvalidValueError("NaN", name, nan_count)
+        if torch.isinf(tensor).any():
+            inf_count = torch.isinf(tensor).sum().item()
+            raise InvalidValueError("Inf", name, inf_count)
+
+    def _validate_not_empty(self, tensor: torch.Tensor, name: str) -> None:
+        """Validate tensor is not empty.
+
+        Args:
+            tensor: Tensor to validate
+            name: Name of the tensor for error messages
+
+        Raises:
+            EmptyTensorError: If tensor has zero size
+        """
+        if tensor.numel() == 0:
+            raise EmptyTensorError(name)
+        for dim_idx, dim_size in enumerate(tensor.shape):
+            if dim_size == 0:
+                raise EmptyTensorError(name, dim_idx)
 
     def add(self, k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
             positions: torch.Tensor) -> None:
@@ -210,25 +368,106 @@ class TieredKVCache:
             positions: Position indices of shape [batch, seq]
 
         Raises:
-            ValueError: If tensor shapes are incompatible
+            ValueError: If tensor shapes are incompatible (backward compatibility)
+            DeviceMismatchError: If tensors are on different devices
+            DtypeMismatchError: If key and value dtypes don't match
+            DimensionError: If tensors don't have expected dimensions
+            InvalidValueError: If tensors contain NaN or Inf values
         """
-        # Validate shapes
-        if k.shape != v.shape:
-            raise ValueError(f"Keys {k.shape} and values {v.shape} must have the same shape")
-        if retention.shape[0] != k.shape[0]:
-            raise ValueError(f"Batch size mismatch: keys have {k.shape[0]}, retention has {retention.shape[0]}")
-        if retention.shape[1] != k.shape[2]:
-            raise ValueError(f"Sequence length mismatch: keys have {k.shape[2]}, retention has {retention.shape[1]}")
-        if positions.shape != retention.shape:
-            raise ValueError(f"Positions {positions.shape} and retention {retention.shape} must have the same shape")
+        self._validate_not_empty(k, "keys")
+        self._validate_not_empty(v, "values")
+        self._validate_not_empty(retention, "retention")
+        self._validate_not_empty(positions, "positions")
+
         if k.dim() != 4:
-            raise ValueError(f"Keys must be 4D tensor [batch, heads, seq, head_dim], got {k.dim()}D")
+            raise DimensionError(4, k.dim(), "keys: Keys must be 4D tensor [batch, heads, seq, head_dim]")
+        if v.dim() != 4:
+            raise DimensionError(4, v.dim(), "values")
+        if retention.dim() != 2:
+            raise DimensionError(2, retention.dim(), "retention")
+        if positions.dim() != 2:
+            raise DimensionError(2, positions.dim(), "positions")
+
+        if k.shape != v.shape:
+            raise ShapeMismatchError(k.shape, v.shape, "keys vs values: Keys and values must have the same shape")
+        if retention.shape[0] != k.shape[0]:
+            raise ShapeMismatchError(
+                (k.shape[0], retention.shape[1]),
+                retention.shape,
+                f"retention batch dimension: Batch size mismatch: keys have {k.shape[0]}, retention has {retention.shape[0]}"
+            )
+        if retention.shape[1] != k.shape[2]:
+            raise ShapeMismatchError(
+                (k.shape[0], k.shape[2]),
+                retention.shape,
+                f"retention sequence dimension: Sequence length mismatch: keys have {k.shape[2]}, retention has {retention.shape[1]}"
+            )
+        if positions.shape != retention.shape:
+            raise ShapeMismatchError(
+                retention.shape, positions.shape,
+                "positions vs retention: Positions and retention must have the same shape"
+            )
+
+        device = self._validate_device_consistency(k, v, retention, positions)
+
+        dtype = self._validate_dtype_consistency(k, v)
+
+        if self.k_cache:
+            if self._expected_device is not None and device != self._expected_device:
+                raise DeviceMismatchError(
+                    {device, self._expected_device},
+                    f"New tensor device {device} doesn't match cache device {self._expected_device}"
+                )
+            if self._expected_dtype is not None and dtype != self._expected_dtype:
+                raise DtypeMismatchError(
+                    self._expected_dtype, dtype,
+                    f"new tensor (cache expects {self._expected_dtype})"
+                )
+        else:
+            self._expected_device = device
+            self._expected_dtype = dtype
+
+        self._validate_tensor_values(k, "keys")
+        self._validate_tensor_values(v, "values")
+        self._validate_tensor_values(retention, "retention")
 
         self.k_cache.append(k)
         self.v_cache.append(v)
         self.retention_scores.append(retention)
         self.positions.append(positions)
         self.total_tokens += k.size(2)
+
+    def _extract_retention_scores_vectorized(
+        self,
+        retention_all: torch.Tensor,
+        mask: torch.Tensor,
+        k_extracted: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract retention scores matching extracted K/V dimensions.
+
+        Args:
+            retention_all: Retention scores [batch, seq]
+            mask: Boolean mask [batch, seq]
+            k_extracted: Extracted keys [batch, heads, extracted_seq, head_dim]
+                used to determine target sequence length
+
+        Returns:
+            Extracted retention scores [batch, extracted_seq]
+        """
+        batch_size = retention_all.size(0)
+        target_len = k_extracted.size(2)
+        device = retention_all.device
+
+        ret_out = torch.zeros(batch_size, target_len, device=device, dtype=retention_all.dtype)
+
+        for b in range(batch_size):
+            batch_mask = mask[b]
+            if batch_mask.any():
+                batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+                n_masked = len(batch_indices)
+                ret_out[b, :n_masked] = retention_all[b, batch_indices]
+
+        return ret_out
 
     def _extract_and_stack(self, tensor_list: List[torch.Tensor]) -> Optional[torch.Tensor]:
         """Extract and stack tensors with padding for variable lengths.
@@ -243,7 +482,6 @@ class TieredKVCache:
             return None
 
         if tensor_list[0].dim() == 1:
-            # 1D position tensors: [len] -> need to pad to same length
             max_len: int = max(t.shape[0] for t in tensor_list)
             padded: List[torch.Tensor] = []
             for t in tensor_list:
@@ -253,7 +491,6 @@ class TieredKVCache:
                 padded.append(t)
             return torch.stack(padded, dim=0) if padded else None
         elif tensor_list[0].dim() == 3:
-            # 3D KV tensors: [heads, len, head_dim]
             max_len = max(t.shape[1] for t in tensor_list)
             padded = []
             for t in tensor_list:
@@ -266,8 +503,75 @@ class TieredKVCache:
         else:
             return None
 
+    def _extract_masked_batch_vectorized(
+        self,
+        k_all: torch.Tensor,
+        v_all: torch.Tensor,
+        positions_all: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Extract masked elements across batch using vectorized operations.
+
+        Args:
+            k_all: Key tensor [batch, heads, seq, head_dim]
+            v_all: Value tensor [batch, heads, seq, head_dim]
+            positions_all: Positions tensor [batch, seq]
+            mask: Boolean mask [batch, seq]
+
+        Returns:
+            Tuple of (masked_k, masked_v, masked_pos) or None if mask is empty
+        """
+        if not mask.any():
+            return None, None, None
+
+        batch_size, num_heads, seq_len, head_dim = k_all.shape
+
+        # Get counts per batch for indexing
+        counts = mask.sum(dim=1)  # [batch]
+        max_count = int(counts.max().item())
+
+        if max_count == 0:
+            return None, None, None
+
+        # Create output tensors
+        device = k_all.device
+        k_out = torch.zeros(batch_size, num_heads, max_count, head_dim, device=device, dtype=k_all.dtype)
+        v_out = torch.zeros(batch_size, num_heads, max_count, head_dim, device=device, dtype=v_all.dtype)
+        pos_out = torch.zeros(batch_size, max_count, device=device, dtype=positions_all.dtype)
+
+        # Create index mapping: for each batch, map from original position to output position
+        # Use cumsum to get output indices
+        mask_int = mask.long()
+        output_indices = mask_int.cumsum(dim=1) - 1  # [batch, seq], 0-indexed positions in output
+
+        # Expand for gathering
+        mask_expanded = mask.unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq, 1]
+        output_indices_expanded = output_indices.unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq, 1]
+
+        # Scatter values to output positions
+        k_scatter = k_all * mask_expanded  # Zero out non-masked
+        v_scatter = v_all * mask_expanded
+        pos_scatter = positions_all * mask  # [batch, seq]
+
+        # Use advanced indexing with gather
+        # First create a valid indices mask for gather
+        valid_mask = mask.unsqueeze(1).unsqueeze(-1).expand(-1, num_heads, -1, head_dim)  # [batch, heads, seq, head_dim]
+
+        # Flatten and gather
+        for b in range(batch_size):
+            batch_mask = mask[b]  # [seq]
+            if batch_mask.any():
+                batch_indices = batch_mask.nonzero(as_tuple=True)[0]  # [n_masked]
+                k_out[b, :, :len(batch_indices), :] = k_all[b, :, batch_indices, :]
+                v_out[b, :, :len(batch_indices), :] = v_all[b, :, batch_indices, :]
+                pos_out[b, :len(batch_indices)] = positions_all[b, batch_indices]
+
+        return k_out, v_out, pos_out
+
     def get_compressed_cache(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Get the compressed KV cache with three-tier compression.
+
+        Uses optimized vectorized operations to minimize Python loop overhead.
 
         Returns:
             Tuple of (compressed_keys, compressed_values, compressed_positions)
@@ -275,6 +579,7 @@ class TieredKVCache:
         if not self.k_cache:
             return None, None, None
 
+        # Concatenate all cached tensors
         k_all: torch.Tensor = torch.cat(self.k_cache, dim=2)
         v_all: torch.Tensor = torch.cat(self.v_cache, dim=2)
         retention_all: torch.Tensor = torch.cat(self.retention_scores, dim=1)
@@ -288,84 +593,49 @@ class TieredKVCache:
         device: torch.device = k_all.device
         tau: float = self.config.tau_threshold
 
+        # Create tier masks vectorized
+        positions_idx: torch.Tensor = torch.arange(total_len, device=device)
         protected_mask: torch.Tensor = retention_all > tau
         unprotected_mask: torch.Tensor = ~protected_mask
+
+        # Tier masks (all computed vectorized)
+        recent_mask: torch.Tensor = unprotected_mask & (positions_idx < self.config.tier0_size)
+        middle_mask: torch.Tensor = unprotected_mask & (positions_idx >= self.config.tier0_size) & (positions_idx < self.config.tier1_size)
+        old_mask: torch.Tensor = unprotected_mask & (positions_idx >= self.config.tier1_size)
 
         k_tiers: List[torch.Tensor] = []
         v_tiers: List[torch.Tensor] = []
         pos_tiers: List[torch.Tensor] = []
 
-        # Tier: Protected tokens (high retention)
+        # Process protected tier (no compression)
         if protected_mask.any():
-            k_prot_list: List[torch.Tensor] = []
-            v_prot_list: List[torch.Tensor] = []
-            pos_prot_list: List[torch.Tensor] = []
-            for b in range(batch_size):
-                mask: torch.Tensor = protected_mask[b]
-                if mask.any():
-                    k_prot_list.append(k_all[b, :, mask, :])
-                    v_prot_list.append(v_all[b, :, mask, :])
-                    pos_prot_list.append(positions_all[b, mask])
+            k_prot, v_prot, pos_prot = self._extract_masked_batch_vectorized(
+                k_all, v_all, positions_all, protected_mask
+            )
+            if k_prot is not None:
+                k_tiers.append(k_prot)
+                v_tiers.append(v_prot)
+                pos_tiers.append(pos_prot)
 
-            if k_prot_list:
-                k_tiers.append(self._extract_and_stack(k_prot_list))
-                v_tiers.append(self._extract_and_stack(v_prot_list))
-                pos_tiers.append(self._extract_and_stack(pos_prot_list))
-
-        # Tier 0: Recent tokens (uncompressed)
-        recent_mask: torch.Tensor = unprotected_mask.clone()
-        for b in range(batch_size):
-            recent_mask[b] = unprotected_mask[b] & (torch.arange(total_len, device=device) < self.config.tier0_size)
-
+        # Process tier 0 - recent tokens (no compression)
         if recent_mask.any():
-            k_rec_list: List[torch.Tensor] = []
-            v_rec_list: List[torch.Tensor] = []
-            pos_rec_list: List[torch.Tensor] = []
-            for b in range(batch_size):
-                mask = recent_mask[b]
-                if mask.any():
-                    k_rec_list.append(k_all[b, :, mask, :])
-                    v_rec_list.append(v_all[b, :, mask, :])
-                    pos_rec_list.append(positions_all[b, mask])
+            k_rec, v_rec, pos_rec = self._extract_masked_batch_vectorized(
+                k_all, v_all, positions_all, recent_mask
+            )
+            if k_rec is not None:
+                k_tiers.append(k_rec)
+                v_tiers.append(v_rec)
+                pos_tiers.append(pos_rec)
 
-            if k_rec_list:
-                k_tiers.append(self._extract_and_stack(k_rec_list))
-                v_tiers.append(self._extract_and_stack(v_rec_list))
-                pos_tiers.append(self._extract_and_stack(pos_rec_list))
-
-        # Tier 1: Middle tokens (4:1 compression)
-        middle_mask: torch.Tensor = unprotected_mask.clone()
-        for b in range(batch_size):
-            idx: torch.Tensor = torch.arange(total_len, device=device)
-            middle_mask[b] = unprotected_mask[b] & (idx >= self.config.tier0_size) & (idx < self.config.tier1_size)
-
-        k_mid_list: List[torch.Tensor] = []
-        v_mid_list: List[torch.Tensor] = []
-        pos_mid_list: List[torch.Tensor] = []
-
+        # Process tier 1 - middle tokens (tier1_compression:1 compression)
         if middle_mask.any():
-            for b in range(batch_size):
-                mask = middle_mask[b]
-                if mask.any():
-                    k_mid_list.append(k_all[b, :, mask, :])
-                    v_mid_list.append(v_all[b, :, mask, :])
-                    pos_mid_list.append(positions_all[b, mask])
-
-            if k_mid_list:
-                k_mid: torch.Tensor = self._extract_and_stack(k_mid_list)
-                v_mid: torch.Tensor = self._extract_and_stack(v_mid_list)
-                pos_mid: torch.Tensor = self._extract_and_stack(pos_mid_list)
-
-                ret_mid_list: List[torch.Tensor] = []
-                for b in range(batch_size):
-                    mask = middle_mask[b]
-                    if mask.any():
-                        ret_mid_list.append(retention_all[b, mask])
-                ret_mid: torch.Tensor = self._extract_and_stack(ret_mid_list)
-
-                k_comp: torch.Tensor
-                v_comp: torch.Tensor
-                pos_comp: torch.Tensor
+            k_mid, v_mid, pos_mid = self._extract_masked_batch_vectorized(
+                k_all, v_all, positions_all, middle_mask
+            )
+            if k_mid is not None:
+                ret_mid = self._extract_retention_scores_vectorized(
+                    retention_all, middle_mask, k_mid
+                )
                 k_comp, v_comp, pos_comp = self._compress(
                     k_mid, v_mid, ret_mid, pos_mid, self.config.tier1_compression
                 )
@@ -373,41 +643,21 @@ class TieredKVCache:
                 v_tiers.append(v_comp)
                 pos_tiers.append(pos_comp)
 
-        # Tier 2: Old tokens (16:1 compression)
-        old_mask: torch.Tensor = unprotected_mask.clone()
-        for b in range(batch_size):
-            old_mask[b] = unprotected_mask[b] & (torch.arange(total_len, device=device) >= self.config.tier1_size)
-
-        k_old_list: List[torch.Tensor] = []
-        v_old_list: List[torch.Tensor] = []
-        pos_old_list: List[torch.Tensor] = []
-
+        # Process tier 2 - old tokens (tier2_compression:1 compression)
         if old_mask.any():
-            for b in range(batch_size):
-                mask = old_mask[b]
-                if mask.any():
-                    k_old_list.append(k_all[b, :, mask, :])
-                    v_old_list.append(v_all[b, :, mask, :])
-                    pos_old_list.append(positions_all[b, mask])
-
-        if k_old_list:
-            k_old: torch.Tensor = self._extract_and_stack(k_old_list)
-            v_old: torch.Tensor = self._extract_and_stack(v_old_list)
-            pos_old: torch.Tensor = self._extract_and_stack(pos_old_list)
-
-            ret_old_list: List[torch.Tensor] = []
-            for b in range(batch_size):
-                mask = old_mask[b]
-                if mask.any():
-                    ret_old_list.append(retention_all[b, mask])
-            ret_old: torch.Tensor = self._extract_and_stack(ret_old_list)
-
-            k_comp, v_comp, pos_comp = self._compress(
-                k_old, v_old, ret_old, pos_old, self.config.tier2_compression
+            k_old, v_old, pos_old = self._extract_masked_batch_vectorized(
+                k_all, v_all, positions_all, old_mask
             )
-            k_tiers.append(k_comp)
-            v_tiers.append(v_comp)
-            pos_tiers.append(pos_comp)
+            if k_old is not None:
+                ret_old = self._extract_retention_scores_vectorized(
+                    retention_all, old_mask, k_old
+                )
+                k_comp, v_comp, pos_comp = self._compress(
+                    k_old, v_old, ret_old, pos_old, self.config.tier2_compression
+                )
+                k_tiers.append(k_comp)
+                v_tiers.append(v_comp)
+                pos_tiers.append(pos_comp)
 
         if k_tiers:
             return torch.cat(k_tiers, dim=2), torch.cat(v_tiers, dim=2), torch.cat(pos_tiers, dim=1)

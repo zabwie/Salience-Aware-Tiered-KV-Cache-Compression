@@ -24,16 +24,45 @@ from .type_prior import (
     compute_type_prior_retention,
 )
 
+from .exceptions import (
+    TTKVError,
+    ValidationError,
+    DeviceMismatchError,
+    DtypeMismatchError,
+    ShapeMismatchError,
+    DimensionError,
+    EmptyTensorError,
+    InvalidValueError,
+    ConfigurationError,
+    CacheError,
+    CompressionError,
+)
+
 __all__ = [
+    # Core components
     "CacheConfig",
     "SalienceScorer",
     "RetentionScheduler",
     "TieredKVCache",
+    # Attention-guided components
     "AttentionGuidedScorer",
     "AttentionBasedKVCache",
     "AttentionGuidedWrapper",
     "extract_attention_weights",
+    # Type prior components
     "MockTypePriorClassifier",
     "create_mock_retention",
     "compute_type_prior_retention",
+    # Exceptions
+    "TTKVError",
+    "ValidationError",
+    "DeviceMismatchError",
+    "DtypeMismatchError",
+    "ShapeMismatchError",
+    "DimensionError",
+    "EmptyTensorError",
+    "InvalidValueError",
+    "ConfigurationError",
+    "CacheError",
+    "CompressionError",
 ]

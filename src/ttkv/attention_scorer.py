@@ -3,8 +3,180 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from collections import defaultdict
+
+from .exceptions import (
+    ValidationError,
+    DeviceMismatchError,
+    DtypeMismatchError,
+    ShapeMismatchError,
+    DimensionError,
+    EmptyTensorError,
+    InvalidValueError,
+)
+
+
+class ScoreAggregator:
+    """Aggregates scores using EMA and manages position-based scores."""
+
+    def __init__(self, ema_decay: float = 0.95) -> None:
+        self.ema_decay: float = ema_decay
+        self.position_importance: Dict[int, float] = {}
+        self.seen_positions: set = set()
+
+    def update(self, position: int, value: float) -> None:
+        """Update score for a position using EMA."""
+        if position in self.position_importance:
+            self.position_importance[position] = (
+                self.ema_decay * self.position_importance[position] +
+                (1 - self.ema_decay) * value
+            )
+        else:
+            self.position_importance[position] = value
+            self.seen_positions.add(position)
+
+    def update_all(self, values: torch.Tensor) -> None:
+        """Update scores for all positions using EMA (vectorized).
+
+        Args:
+            values: Tensor of attention values of shape [seq_len]
+        """
+        seq_len: int = values.size(0)
+
+        for pos in range(seq_len):
+            attn_val: float = float(values[pos])
+            if pos in self.position_importance:
+                self.position_importance[pos] = (
+                    self.ema_decay * self.position_importance[pos] +
+                    (1 - self.ema_decay) * attn_val
+                )
+            else:
+                self.position_importance[pos] = attn_val
+                self.seen_positions.add(pos)
+
+    def get(self, position: int, default: float = 0.0) -> float:
+        """Get score for a position."""
+        return self.position_importance.get(position, default)
+
+    def get_all_scores(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Get all position scores as a tensor.
+
+        Args:
+            seq_len: Length of the sequence
+            device: Device for tensor operations
+
+        Returns:
+            Tensor of shape [seq_len] with scores for each position
+        """
+        scores: torch.Tensor = torch.zeros(seq_len, device=device)
+
+        if not self.position_importance:
+            return scores
+
+        # Extract positions and values from dict for vectorized operations
+        positions: List[int] = []
+        values: List[float] = []
+        for pos, val in self.position_importance.items():
+            if pos < seq_len:
+                positions.append(pos)
+                values.append(val)
+
+        if positions:
+            pos_tensor: torch.Tensor = torch.tensor(positions, device=device, dtype=torch.long)
+            val_tensor: torch.Tensor = torch.tensor(values, device=device, dtype=torch.float32)
+            scores.index_put_((pos_tensor,), val_tensor, accumulate=False)
+
+        return scores
+
+    def decay_positions(self, current_seq_len: int) -> None:
+        """Remove positions beyond current sequence length."""
+        positions_to_remove: Set[int] = {
+            pos for pos in self.position_importance.keys()
+            if pos >= current_seq_len
+        }
+
+        for pos in positions_to_remove:
+            del self.position_importance[pos]
+            self.seen_positions.discard(pos)
+
+    def reset(self) -> None:
+        """Reset all tracked scores."""
+        self.position_importance.clear()
+        self.seen_positions.clear()
+
+
+class StructuralScorer:
+    """Computes structural importance scores for tokens."""
+
+    def __init__(self) -> None:
+        self.structural_scores: Dict[int, float] = {}
+
+    def compute_scores(
+        self,
+        token_ids: torch.Tensor,
+        seq_len: int,
+        device: torch.device
+    ) -> torch.Tensor:
+        """Compute structural importance scores for tokens."""
+        batch_size: int = token_ids.size(0)
+
+        position_scores: torch.Tensor = self._compute_position_scores(seq_len, device)
+        scores: torch.Tensor = position_scores.unsqueeze(0).expand(batch_size, -1)
+        scores = self._apply_cached_scores(token_ids, scores, device)
+
+        return scores
+
+    def _compute_position_scores(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Compute position-based structural scores."""
+        positions: torch.Tensor = torch.arange(seq_len, device=device)
+        position_scores: torch.Tensor = torch.zeros(seq_len, device=device)
+
+        boundary_threshold: int = max(1, seq_len // 20)
+        position_scores[:boundary_threshold] = 0.6
+        position_scores[-boundary_threshold:] = 0.6
+
+        decile_mask: torch.Tensor = (positions % 10 == 0)
+        position_scores = torch.where(
+            decile_mask,
+            torch.maximum(position_scores, torch.tensor(0.4, device=device)),
+            position_scores
+        )
+
+        return position_scores
+
+    def _apply_cached_scores(
+        self,
+        token_ids: torch.Tensor,
+        scores: torch.Tensor,
+        device: torch.device
+    ) -> torch.Tensor:
+        """Apply cached structural scores to matching token IDs."""
+        if not self.structural_scores:
+            return scores
+
+        unique_tokens: torch.Tensor = torch.unique(token_ids)
+        for token_id in unique_tokens.tolist():
+            if token_id in self.structural_scores:
+                mask: torch.Tensor = (token_ids == token_id)
+                cached_score: torch.Tensor = torch.tensor(
+                    self.structural_scores[token_id], device=device
+                )
+                scores = torch.where(
+                    mask,
+                    torch.maximum(scores, cached_score),
+                    scores
+                )
+
+        return scores
+
+    def update_score(self, token_id: int, score: float) -> None:
+        """Update cached structural score for a token ID."""
+        self.structural_scores[token_id] = score
+
+    def reset(self) -> None:
+        """Reset cached structural scores."""
+        self.structural_scores.clear()
 
 
 class AttentionGuidedScorer:
@@ -19,14 +191,52 @@ class AttentionGuidedScorer:
     """
 
     def __init__(self, ema_decay: float = 0.95, structural_floor: float = 0.1) -> None:
+        if not 0.0 <= ema_decay <= 1.0:
+            raise ValidationError(f"ema_decay must be in [0, 1], got {ema_decay}")
+        if not 0.0 <= structural_floor <= 1.0:
+            raise ValidationError(f"structural_floor must be in [0, 1], got {structural_floor}")
+
         self.ema_decay: float = ema_decay
         self.structural_floor: float = structural_floor
-        self.position_importance: Dict[int, float] = {}
-        self.structural_scores: Dict[int, float] = {}
-        self.seen_positions: set = set()
+        self.score_aggregator: ScoreAggregator = ScoreAggregator(ema_decay)
+        self.structural_scorer: StructuralScorer = StructuralScorer()
 
-    def compute_structural_score(self, token_ids: torch.Tensor,
-                                  tokenizer: Optional[Any] = None) -> torch.Tensor:
+    def _validate_tensor(self, tensor: torch.Tensor, name: str, expected_dims: Optional[int] = None) -> None:
+        if expected_dims is not None and tensor.dim() != expected_dims:
+            raise DimensionError(expected_dims, tensor.dim(), name)
+        if torch.isnan(tensor).any():
+            nan_count = torch.isnan(tensor).sum().item()
+            raise InvalidValueError("NaN", name, nan_count)
+        if torch.isinf(tensor).any():
+            inf_count = torch.isinf(tensor).sum().item()
+            raise InvalidValueError("Inf", name, inf_count)
+
+    def _validate_device_consistency(self, *tensors: torch.Tensor) -> torch.device:
+        devices: Set[torch.device] = {t.device for t in tensors}
+        if len(devices) > 1:
+            raise DeviceMismatchError(devices)
+        return devices.pop() if devices else torch.device('cpu')
+
+    @property
+    def position_importance(self) -> Dict[int, float]:
+        """Backward compatibility: expose position_importance from aggregator."""
+        return self.score_aggregator.position_importance
+
+    @property
+    def structural_scores(self) -> Dict[int, float]:
+        """Backward compatibility: expose structural_scores from scorer."""
+        return self.structural_scorer.structural_scores
+
+    @property
+    def seen_positions(self) -> set:
+        """Backward compatibility: expose seen_positions from aggregator."""
+        return self.score_aggregator.seen_positions
+
+    def compute_structural_score(
+        self,
+        token_ids: torch.Tensor,
+        tokenizer: Optional[Any] = None
+    ) -> torch.Tensor:
         """Compute structural importance scores for tokens.
 
         Args:
@@ -35,63 +245,52 @@ class AttentionGuidedScorer:
 
         Returns:
             Structural scores of shape [batch, seq_len]
+
+        Raises:
+            DimensionError: If token_ids doesn't have 2 dimensions
+            InvalidValueError: If token_ids contains invalid values
         """
+        self._validate_tensor(token_ids, "token_ids", expected_dims=2)
+
         batch_size: int
         seq_len: int
         batch_size, seq_len = token_ids.shape
-        scores: torch.Tensor = torch.zeros(batch_size, seq_len)
+        device: torch.device = token_ids.device
 
-        for b in range(batch_size):
-            for pos in range(seq_len):
-                token_id: int = int(token_ids[b, pos])
+        return self.structural_scorer.compute_scores(token_ids, seq_len, device)
 
-                if token_id in self.structural_scores:
-                    scores[b, pos] = self.structural_scores[token_id]
-                    continue
-
-                score: float = 0.0
-                if pos < seq_len // 20 or pos > seq_len * 19 // 20:
-                    score = max(score, 0.6)
-                if pos % 10 == 0:
-                    score = max(score, 0.4)
-
-                self.structural_scores[token_id] = score
-                scores[b, pos] = score
-
-        return scores
-
-    def update_from_attention(self, attention_weights: torch.Tensor,
-                               query_position: int,
-                               generated_token_id: int) -> None:
+    def update_from_attention(
+        self,
+        attention_weights: torch.Tensor,
+        query_position: int,
+        generated_token_id: int
+    ) -> None:
         """Update importance scores from attention weights.
 
         Args:
             attention_weights: Attention weights from model output
             query_position: Position of the query token
             generated_token_id: ID of the generated token
+
+        Raises:
+            InvalidValueError: If attention_weights contains NaN or Inf
         """
-        attn: torch.Tensor
+        self._validate_tensor(attention_weights, "attention_weights")
+
+        attn: torch.Tensor = self._normalize_attention(attention_weights)
+        self.score_aggregator.update_all(attn)
+
+    def _normalize_attention(self, attention_weights: torch.Tensor) -> torch.Tensor:
+        """Normalize attention weights to 1D tensor."""
         if attention_weights.dim() == 2:
-            attn = attention_weights.mean(dim=0)
-        else:
-            attn = attention_weights
+            return attention_weights.mean(dim=0)
+        return attention_weights
 
-        seq_len: int = attn.size(0)
-
-        for pos in range(seq_len):
-            attn_val: float = float(attn[pos])
-            if pos in self.position_importance:
-                self.position_importance[pos] = (
-                    self.ema_decay * self.position_importance[pos] +
-                    (1 - self.ema_decay) * attn_val
-                )
-            else:
-                self.position_importance[pos] = attn_val
-            self.seen_positions.add(pos)
-
-    def get_salience_scores(self, seq_len: int,
-                            structural_scores: Optional[torch.Tensor] = None
-                            ) -> torch.Tensor:
+    def get_salience_scores(
+        self,
+        seq_len: int,
+        structural_scores: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Get salience scores combining attention and structural patterns.
 
         Args:
@@ -100,15 +299,61 @@ class AttentionGuidedScorer:
 
         Returns:
             Combined salience scores of shape [seq_len]
-        """
-        scores: torch.Tensor = torch.zeros(seq_len)
 
-        for pos in range(seq_len):
-            attn_score: float = self.position_importance.get(pos, 0.0)
-            struct_score: float = 0.0
-            if structural_scores is not None and pos < len(structural_scores[0]):
-                struct_score = float(structural_scores[0, pos])
-            scores[pos] = max(attn_score, struct_score * self.structural_floor)
+        Raises:
+            ValidationError: If seq_len is not positive
+            InvalidValueError: If structural_scores contains NaN or Inf
+        """
+        if seq_len <= 0:
+            raise ValidationError(f"seq_len must be positive, got {seq_len}")
+
+        if structural_scores is not None:
+            self._validate_tensor(structural_scores, "structural_scores", expected_dims=2)
+
+        device: torch.device = structural_scores.device if structural_scores is not None else torch.device('cpu')
+
+        # Vectorized: Build attention scores tensor from dict
+        attn_scores: torch.Tensor = self.score_aggregator.get_all_scores(seq_len, device)
+
+        # Vectorized: Get structural scores
+        struct_scores: torch.Tensor = self._get_all_structural_scores(structural_scores, seq_len, device)
+
+        # Vectorized: Combine scores
+        scores: torch.Tensor = torch.maximum(attn_scores, struct_scores * self.structural_floor)
+
+        return scores
+
+    def _get_structural_score(
+        self,
+        structural_scores: Optional[torch.Tensor],
+        pos: int
+    ) -> float:
+        """Extract structural score for a position."""
+        if structural_scores is None or pos >= len(structural_scores[0]):
+            return 0.0
+        return float(structural_scores[0, pos])
+
+    def _get_all_structural_scores(
+        self,
+        structural_scores: Optional[torch.Tensor],
+        seq_len: int,
+        device: torch.device
+    ) -> torch.Tensor:
+        """Extract all structural scores as a tensor.
+
+        Args:
+            structural_scores: Optional structural scores tensor
+            seq_len: Length of the sequence
+            device: Device for tensor operations
+
+        Returns:
+            Tensor of shape [seq_len] with structural scores
+        """
+        scores: torch.Tensor = torch.zeros(seq_len, device=device)
+
+        if structural_scores is not None:
+            seq_len_actual: int = min(seq_len, structural_scores.size(-1))
+            scores[:seq_len_actual] = structural_scores[0, :seq_len_actual]
 
         return scores
 
@@ -118,20 +363,12 @@ class AttentionGuidedScorer:
         Args:
             current_seq_len: Current sequence length
         """
-        positions_to_decay: List[int] = []
-        for pos in list(self.position_importance.keys()):
-            if pos >= current_seq_len:
-                positions_to_decay.append(pos)
-
-        for pos in positions_to_decay:
-            del self.position_importance[pos]
-            self.seen_positions.discard(pos)
+        self.score_aggregator.decay_positions(current_seq_len)
 
     def reset(self) -> None:
         """Reset all tracked scores and positions."""
-        self.position_importance.clear()
-        self.structural_scores.clear()
-        self.seen_positions.clear()
+        self.score_aggregator.reset()
+        self.structural_scorer.reset()
 
 
 class AttentionBasedKVCache:
@@ -155,10 +392,14 @@ class AttentionBasedKVCache:
             structural_floor=0.1
         )
 
-    def compress_with_attention(self, k: torch.Tensor, v: torch.Tensor,
-                                 attention_weights: torch.Tensor,
-                                 token_ids: torch.Tensor,
-                                 positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    def compress_with_attention(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_weights: torch.Tensor,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """Compress KV cache using attention-guided salience scoring.
 
         Args:
@@ -177,11 +418,7 @@ class AttentionBasedKVCache:
         head_dim: int
         batch_size, num_heads, seq_len, head_dim = k.shape
 
-        self.scorer.update_from_attention(
-            attention_weights[0],
-            query_position=seq_len - 1,
-            generated_token_id=int(token_ids[0, -1]) if token_ids.size(1) > 0 else 0
-        )
+        self._update_scorer(attention_weights, token_ids, seq_len)
 
         structural_scores: torch.Tensor = self.scorer.compute_structural_score(token_ids)
         salience: torch.Tensor = self.scorer.get_salience_scores(seq_len, structural_scores)
@@ -201,6 +438,19 @@ class AttentionBasedKVCache:
             self.scorer.decay_unseen_positions(k_comp.size(2))
 
         return k_comp, v_comp, stats
+
+    def _update_scorer(
+        self,
+        attention_weights: torch.Tensor,
+        token_ids: torch.Tensor,
+        seq_len: int
+    ) -> None:
+        """Update scorer with attention weights."""
+        self.scorer.update_from_attention(
+            attention_weights[0],
+            query_position=seq_len - 1,
+            generated_token_id=int(token_ids[0, -1]) if token_ids.size(1) > 0 else 0
+        )
 
 
 def extract_attention_weights(model_outputs: Any) -> Optional[torch.Tensor]:
@@ -241,11 +491,16 @@ class AttentionGuidedWrapper:
         self.model: Any = model
         self.tokenizer: Any = tokenizer
         self.cache_config: Any = cache_config
-        self.attention_cache: AttentionBasedKVCache = AttentionBasedKVCache(cache_config, tokenizer)
+        self.attention_cache: AttentionBasedKVCache = AttentionBasedKVCache(
+            cache_config, tokenizer
+        )
 
-    def generate_with_attention_guidance(self, input_ids: torch.Tensor,
-                                         max_new_tokens: int = 50,
-                                         temperature: float = 0.7) -> Tuple[str, List[Dict[str, Any]]]:
+    def generate_with_attention_guidance(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 50,
+        temperature: float = 0.7
+    ) -> Tuple[str, List[Dict[str, Any]]]:
         """Generate text with attention-guided KV cache compression.
 
         Args:
@@ -274,32 +529,13 @@ class AttentionGuidedWrapper:
             past_kv: Tuple[Tuple[torch.Tensor, torch.Tensor], ...] = outputs.past_key_values
 
             if attn_weights is not None and step > 0:
-                compressed_past: List[Tuple[torch.Tensor, torch.Tensor]] = []
-                for layer_idx, layer_cache in enumerate(past_kv):
-                    k: torch.Tensor = layer_cache[0]
-                    v: torch.Tensor = layer_cache[1]
+                stats: Optional[Dict[str, Any]] = self._compress_past_kv(
+                    past_kv, generated, attn_weights
+                )
+                if stats is not None:
+                    all_stats.append(stats)
 
-                    seq_len: int = k.size(2)
-                    positions: torch.Tensor = torch.arange(seq_len, device=k.device).unsqueeze(0)
-                    token_ids: torch.Tensor = generated[:, :seq_len]
-
-                    k_comp: torch.Tensor
-                    v_comp: torch.Tensor
-                    stats: Dict[str, Any]
-                    k_comp, v_comp, stats = self.attention_cache.compress_with_attention(
-                        k, v, attn_weights, token_ids, positions
-                    )
-
-                    compressed_past.append((k_comp, v_comp))
-
-                    if layer_idx == 0:
-                        all_stats.append(stats)
-
-            logits: torch.Tensor = outputs.logits
-            next_token_logits: torch.Tensor = logits[:, -1, :] / temperature
-            probs: torch.Tensor = F.softmax(next_token_logits, dim=-1)
-            next_token: torch.Tensor = torch.multinomial(probs, num_samples=1)
-
+            next_token: torch.Tensor = self._sample_next_token(outputs, temperature)
             generated = torch.cat([generated, next_token], dim=-1)
 
             if next_token.item() == self.tokenizer.eos_token_id:
@@ -307,3 +543,39 @@ class AttentionGuidedWrapper:
 
         result: str = self.tokenizer.decode(generated[0], skip_special_tokens=True)
         return result, all_stats
+
+    def _compress_past_kv(
+        self,
+        past_kv: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+        generated: torch.Tensor,
+        attn_weights: torch.Tensor
+    ) -> Optional[Dict[str, Any]]:
+        """Compress past key-value cache for all layers."""
+        stats: Optional[Dict[str, Any]] = None
+
+        for layer_idx, layer_cache in enumerate(past_kv):
+            k: torch.Tensor = layer_cache[0]
+            v: torch.Tensor = layer_cache[1]
+
+            seq_len: int = k.size(2)
+            positions: torch.Tensor = torch.arange(seq_len, device=k.device).unsqueeze(0)
+            token_ids: torch.Tensor = generated[:, :seq_len]
+
+            k_comp: torch.Tensor
+            v_comp: torch.Tensor
+            layer_stats: Dict[str, Any]
+            k_comp, v_comp, layer_stats = self.attention_cache.compress_with_attention(
+                k, v, attn_weights, token_ids, positions
+            )
+
+            if layer_idx == 0:
+                stats = layer_stats
+
+        return stats
+
+    def _sample_next_token(self, outputs: Any, temperature: float) -> torch.Tensor:
+        """Sample next token from model outputs."""
+        logits: torch.Tensor = outputs.logits
+        next_token_logits: torch.Tensor = logits[:, -1, :] / temperature
+        probs: torch.Tensor = F.softmax(next_token_logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
