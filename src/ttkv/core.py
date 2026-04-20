@@ -343,6 +343,7 @@ class TieredKVCache:
         self._tier_counts: Tuple[int, int, int, int] = (0, 0, 0, 0)
         self._compression_time_ms: float = 0.0
         self._jit_cache: Optional[Any] = None
+        self._finalizer = weakref.finalize(self, self._cleanup_resources)
         self.clear()
 
     def clear(self) -> None:
@@ -366,12 +367,23 @@ class TieredKVCache:
         """Exit context manager with automatic cleanup."""
         self.clear()
 
-    def __del__(self) -> None:
-        """Destructor with automatic GPU memory cleanup and synchronization."""
-        self.clear()
-        # Force CUDA synchronization to ensure cleanup completes before object destruction
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+    def _cleanup_resources(self) -> None:
+        """Clean up resources explicitly. Called by weakref.finalize, not __del__."""
+        try:
+            self.clear()
+        except Exception:
+            # Ignore any errors during cleanup from weakref.finalize
+            pass
+
+    @staticmethod
+    def _finalize_cleanup(cache_ref: weakref.ref) -> None:
+        """Static cleanup function for weakref.finalize."""
+        cache = cache_ref()
+        if cache is not None:
+            try:
+                cache._cleanup_resources()
+            except Exception:
+                pass
 
     def _get_peak_memory_mb(self) -> float:
         """Get peak GPU memory allocated in MB."""
@@ -630,31 +642,41 @@ class TieredKVCache:
         pos_out = torch.zeros(batch_size, max_count, device=device, dtype=positions_all.dtype)
 
         # Create index mapping: for each batch, map from original position to output position
-        # Use cumsum to get output indices
+        # Use cumsum to get output indices (1-indexed, 0 = not in mask)
         mask_int = mask.long()
-        output_indices = mask_int.cumsum(dim=1) - 1  # [batch, seq], 0-indexed positions in output
+        output_indices = mask_int.cumsum(dim=1)  # [batch, seq], 1-indexed positions in output
 
-        # Expand for gathering
+        # Build flat indices for scatter: [batch, heads, seq, head_dim] -> flat index
+        # For each position in [batch, seq] that is masked, compute its flat index in output
+        batch_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, seq_len)  # [batch, seq]
+        head_idx = torch.arange(num_heads, device=device).view(1, 1, num_heads)  # [1, 1, heads]
+
+        # True vectorized extraction using scatter with flat indices
+        # Flatten output to [batch * heads * max_count, head_dim] for scatter
+        flat_output_idx = output_indices.unsqueeze(1).unsqueeze(-1) - 1  # [batch, 1, seq, 1], 0-indexed
+        flat_batch_idx = batch_idx.unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq, 1]
+
+        # Expand mask for broadcasting
         mask_expanded = mask.unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq, 1]
-        output_indices_expanded = output_indices.unsqueeze(1).unsqueeze(-1)  # [batch, 1, seq, 1]
 
-        # Scatter values to output positions
-        k_scatter = k_all * mask_expanded  # Zero out non-masked
-        v_scatter = v_all * mask_expanded
-        pos_scatter = positions_all * mask  # [batch, seq]
+        # Compute flat indices: batch * heads * max_count + head * max_count + pos
+        # Only compute for masked positions
+        if mask.any():
+            # Get all masked positions across all batches at once
+            batch_indices, seq_indices = mask.nonzero(as_tuple=True)  # Both [total_masked]
 
-        # Use advanced indexing with gather
-        # First create a valid indices mask for gather
-        valid_mask = mask.unsqueeze(1).unsqueeze(-1).expand(-1, num_heads, -1, head_dim)  # [batch, heads, seq, head_dim]
+            # Gather values for all masked positions
+            k_gathered = k_all[batch_indices, :, seq_indices, :]  # [total_masked, heads, head_dim]
+            v_gathered = v_all[batch_indices, :, seq_indices, :]  # [total_masked, heads, head_dim]
+            pos_gathered = positions_all[batch_indices, seq_indices]  # [total_masked]
 
-        # Flatten and gather
-        for b in range(batch_size):
-            batch_mask = mask[b]  # [seq]
-            if batch_mask.any():
-                batch_indices = batch_mask.nonzero(as_tuple=True)[0]  # [n_masked]
-                k_out[b, :, :len(batch_indices), :] = k_all[b, :, batch_indices, :]
-                v_out[b, :, :len(batch_indices), :] = v_all[b, :, batch_indices, :]
-                pos_out[b, :len(batch_indices)] = positions_all[b, batch_indices]
+            # Compute output positions within each batch
+            output_pos = output_indices[batch_indices, seq_indices] - 1  # [total_masked]
+
+            # Scatter to output tensors using advanced indexing
+            k_out[batch_indices, :, output_pos, :] = k_gathered
+            v_out[batch_indices, :, output_pos, :] = v_gathered
+            pos_out[batch_indices, output_pos] = pos_gathered
 
         return k_out, v_out, pos_out
 
@@ -666,6 +688,9 @@ class TieredKVCache:
         Returns:
             Tuple of (compressed_keys, compressed_values, compressed_positions)
         """
+        import time
+        start_time = time.perf_counter()
+
         if not self.k_cache:
             return None, None, None
 
@@ -762,6 +787,10 @@ class TieredKVCache:
         # Store tier counts for observability
         self._tier_counts = (protected_count, tier0_count, tier1_count, tier2_count)
 
+        # Record compression time
+        end_time = time.perf_counter()
+        self._compression_time_ms = (end_time - start_time) * 1000.0
+
         if k_tiers:
             return torch.cat(k_tiers, dim=2), torch.cat(v_tiers, dim=2), torch.cat(pos_tiers, dim=1)
         else:
@@ -818,15 +847,52 @@ class TieredKVCache:
 
         return k_pooled, v_pooled, pos_pooled
 
+    @staticmethod
     @torch.compile(mode='reduce-overhead', fullgraph=False)
+    def _compress_impl(k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
+                       positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """JIT-compiled compression implementation.
+
+        This static method contains the actual compression logic that gets
+        compiled by torch.compile. Static method avoids self reference issues.
+        """
+        batch_size, num_heads, seq_len, head_dim = k.shape
+        device = k.device
+
+        if seq_len == 0:
+            return k, v, positions
+
+        compressed_len = (seq_len + ratio - 1) // ratio
+        pad_len = compressed_len * ratio - seq_len
+
+        if pad_len > 0:
+            k = F.pad(k, (0, 0, 0, pad_len), value=0.0)
+            v = F.pad(v, (0, 0, 0, pad_len), value=0.0)
+            retention = F.pad(retention, (0, pad_len), value=float('-inf'))
+            positions = F.pad(positions, (0, pad_len), value=0)
+
+        k_reshaped = k.view(batch_size, num_heads, compressed_len, ratio, head_dim)
+        v_reshaped = v.view(batch_size, num_heads, compressed_len, ratio, head_dim)
+        ret_reshaped = retention.view(batch_size, compressed_len, ratio)
+        pos_reshaped = positions.view(batch_size, compressed_len, ratio)
+
+        weights = F.softmax(ret_reshaped, dim=-1)
+        weights_kv = weights.unsqueeze(1).unsqueeze(-1)
+
+        k_pooled = (k_reshaped * weights_kv).sum(dim=3)
+        v_pooled = (v_reshaped * weights_kv).sum(dim=3)
+        pos_pooled = (pos_reshaped.float() * weights).sum(dim=-1).long()
+
+        return k_pooled, v_pooled, pos_pooled
+
     def _compress_jit(self, k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
                       positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """JIT-compiled compression for production inference.
 
         Uses torch.compile for optimized kernel fusion on PyTorch 2.0+.
-        Falls back to eager mode on older PyTorch versions.
+        The actual implementation is in _compress_impl which is compiled once.
         """
-        return self._compress_eager(k, v, retention, positions, ratio)
+        return self._compress_impl(k, v, retention, positions, ratio)
 
     def _compress(self, k: torch.Tensor, v: torch.Tensor, retention: torch.Tensor,
                   positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
