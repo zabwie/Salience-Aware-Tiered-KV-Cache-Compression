@@ -84,7 +84,9 @@ class CacheConfig:
         tau_threshold: Threshold for protected tokens (default: 0.8)
         enable_jit: Whether to enable JIT compilation for compression (default: True)
         quantization_bits: Quantization bits for KV cache (None, 4, or 8) (default: None)
+        quantization_group_size: Group size for quantization (default: 128)
         max_cache_size: Maximum cache size in tokens before forced compression (default: 8192)
+        dynamic_tiers: Whether to dynamically adjust tier sizes based on attention entropy (default: True)
     """
     hidden_dim: int = 768
     num_heads: int = 12
@@ -98,7 +100,9 @@ class CacheConfig:
     tau_threshold: float = 0.8
     enable_jit: bool = True
     quantization_bits: Optional[int] = None
+    quantization_group_size: int = 128
     max_cache_size: int = 8192
+    dynamic_tiers: bool = True
 
     def __post_init__(self) -> None:
         if self.hidden_dim <= 0:
@@ -358,6 +362,11 @@ class TieredKVCache:
         self._compression_time_ms: float = 0.0
         self._jit_cache: Optional[Any] = None
         self._finalizer = weakref.finalize(self, self._cleanup_resources)
+        # Tiered storage for streaming compression
+        self._tier2_k_cache: List[torch.Tensor] = []
+        self._tier2_v_cache: List[torch.Tensor] = []
+        self._tier2_positions: List[torch.Tensor] = []
+        self._tier2_count: int = 0
         self.clear()
 
     def clear(self) -> None:
@@ -372,6 +381,10 @@ class TieredKVCache:
             self._expected_device = None
             self._tier_counts = (0, 0, 0, 0)
             self._compression_time_ms = 0.0
+            self._tier2_k_cache = []
+            self._tier2_v_cache = []
+            self._tier2_positions = []
+            self._tier2_count = 0
 
     def __enter__(self) -> 'TieredKVCache':
         """Enter context manager."""
@@ -601,6 +614,46 @@ class TieredKVCache:
 
         return ret_out
 
+    def _compute_dynamic_tier_sizes(self, retention_all: torch.Tensor) -> Tuple[int, int]:
+        """Compute dynamic tier sizes based on attention entropy.
+
+        High entropy (diverse attention) = more tokens need protection.
+        Low entropy (focused attention) = can compress more aggressively.
+
+        Args:
+            retention_all: Retention scores [batch, seq]
+
+        Returns:
+            Tuple of (tier0_size, tier1_size) adjusted based on entropy
+        """
+        if not self.config.dynamic_tiers:
+            return self.config.tier0_size, self.config.tier1_size
+
+        # Compute attention entropy across sequence
+        # Normalize retention to probabilities
+        probs = F.softmax(retention_all.mean(dim=0), dim=0)  # [seq]
+
+        # Compute entropy: -sum(p * log(p))
+        entropy = -(probs * torch.log(probs + 1e-10)).sum()
+
+        # Normalize entropy to [0, 1] range (max entropy is log(seq_len))
+        seq_len = retention_all.size(1)
+        max_entropy = np.log(seq_len) if seq_len > 0 else 1.0
+        normalized_entropy = (entropy / max_entropy).clamp(0, 1)
+
+        # Adjust tier sizes based on entropy
+        # High entropy -> larger recent window (more protection needed)
+        # Low entropy -> smaller recent window (can compress more)
+        if normalized_entropy > 0.7:
+            # High entropy: protect more tokens
+            return 512, 4096
+        elif normalized_entropy > 0.4:
+            # Medium entropy: standard sizes
+            return 256, 2048
+        else:
+            # Low entropy: can compress aggressively
+            return 128, 1024
+
     def _extract_and_stack(self, tensor_list: List[torch.Tensor]) -> Optional[torch.Tensor]:
         """Extract and stack tensors with padding for variable lengths.
 
@@ -743,10 +796,13 @@ class TieredKVCache:
         protected_mask: torch.Tensor = retention_all > tau
         unprotected_mask: torch.Tensor = ~protected_mask
 
+        # Compute dynamic tier sizes based on attention entropy
+        tier0_size, tier1_size = self._compute_dynamic_tier_sizes(retention_all)
+
         # Tier masks (all computed vectorized)
-        recent_mask: torch.Tensor = unprotected_mask & (positions_idx < self.config.tier0_size)
-        middle_mask: torch.Tensor = unprotected_mask & (positions_idx >= self.config.tier0_size) & (positions_idx < self.config.tier1_size)
-        old_mask: torch.Tensor = unprotected_mask & (positions_idx >= self.config.tier1_size)
+        recent_mask: torch.Tensor = unprotected_mask & (positions_idx < tier0_size)
+        middle_mask: torch.Tensor = unprotected_mask & (positions_idx >= tier0_size) & (positions_idx < tier1_size)
+        old_mask: torch.Tensor = unprotected_mask & (positions_idx >= tier1_size)
 
         k_tiers: List[torch.Tensor] = []
         v_tiers: List[torch.Tensor] = []
@@ -806,13 +862,20 @@ class TieredKVCache:
                 ret_old = self._extract_retention_scores_vectorized(
                     retention_all, old_mask, k_old
                 )
-                tier2_count = k_old.size(2)  # Before compression
+                tier2_count = k_old.size(2) # Before compression
                 k_comp, v_comp, pos_comp = self._compress(
                     k_old, v_old, ret_old, pos_old, self.config.tier2_compression
                 )
                 k_tiers.append(k_comp)
                 v_tiers.append(v_comp)
                 pos_tiers.append(pos_comp)
+
+        # Include tier2 data from streaming compression
+        if self._tier2_k_cache:
+            k_tiers.extend(self._tier2_k_cache)
+            v_tiers.extend(self._tier2_v_cache)
+            pos_tiers.extend(self._tier2_positions)
+            tier2_count += self._tier2_count
 
         # Store tier counts for observability
         self._tier_counts = (protected_count, tier0_count, tier1_count, tier2_count)
@@ -953,15 +1016,16 @@ class TieredKVCache:
 
         return result
 
-    def _quantize(self, tensor: torch.Tensor, bits: int) -> torch.Tensor:
-        """Quantize tensor to specified bits (4 or 8).
+    def _quantize(self, tensor: torch.Tensor, bits: int, group_size: int = 128) -> torch.Tensor:
+        """Quantize tensor using group-wise quantization (vLLM-style).
 
-        Uses absmax quantization: scale = max(abs(tensor)),
-        quantized = round(tensor / scale * max_val).
+        Groups elements and computes per-group scales for better accuracy.
+        Default group_size=128 as used in vLLM and other SOTA implementations.
 
         Args:
-            tensor: Input tensor to quantize
+            tensor: Input tensor to quantize [batch, heads, seq, head_dim]
             bits: Number of bits (4 or 8)
+            group_size: Size of quantization groups (default: 128)
 
         Returns:
             Quantized tensor (stored as original dtype but with quantized values)
@@ -969,23 +1033,43 @@ class TieredKVCache:
         if bits not in (4, 8):
             raise ConfigurationError(f"quantization_bits must be 4 or 8, got {bits}")
 
+        batch_size, num_heads, seq_len, head_dim = tensor.shape
+
+        # Pad head_dim to be divisible by group_size
+        pad_len = (group_size - head_dim % group_size) % group_size
+        if pad_len > 0:
+            tensor = F.pad(tensor, (0, pad_len), value=0.0)
+
+        # Reshape to [batch, heads, seq, num_groups, group_size]
+        padded_dim = head_dim + pad_len
+        num_groups = padded_dim // group_size
+        tensor_reshaped = tensor.view(batch_size, num_heads, seq_len, num_groups, group_size)
+
         max_val = 2 ** (bits - 1) - 1
 
-        # Compute scale per head per batch
-        scale = tensor.abs().max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
+        # Compute scale per group: [batch, heads, seq, num_groups, 1]
+        scale = tensor_reshaped.abs().max(dim=-1, keepdim=True)[0]
         scale = torch.clamp(scale, min=1e-8)
 
-        # Quantize
-        quantized = torch.round(tensor / scale * max_val)
+        # Quantize per group
+        quantized = torch.round(tensor_reshaped / scale * max_val)
         quantized = torch.clamp(quantized, -max_val - 1, max_val)
 
         # Dequantize back to original range
         dequantized = quantized / max_val * scale
 
+        # Reshape back and remove padding
+        dequantized = dequantized.view(batch_size, num_heads, seq_len, padded_dim)
+        if pad_len > 0:
+            dequantized = dequantized[..., :head_dim]
+
         return dequantized
 
     def _maybe_compress_oldest_tier(self) -> bool:
-        """Compress oldest tier if cache exceeds max size.
+        """Compress oldest tokens to tier2 instead of evicting.
+
+        True streaming: oldest tokens get compressed with tier2_compression:1 ratio
+        and stored in _tier2_* caches, not thrown away.
 
         Returns:
             True if compression was performed
@@ -996,37 +1080,73 @@ class TieredKVCache:
         if not self.k_cache:
             return False
 
-        # Compress the oldest entries to make room
-        # Keep only the most recent max_cache_size tokens
-        tokens_to_remove = self.total_tokens - self.config.max_cache_size
+        tokens_to_compress = self.total_tokens - self.config.max_cache_size
 
-        if tokens_to_remove <= 0:
+        if tokens_to_compress <= 0:
             return False
 
-        # Remove oldest entries from the cache lists
         with self._lock:
-            removed = 0
-            while removed < tokens_to_remove and self.k_cache:
+            compressed = 0
+            while compressed < tokens_to_compress and self.k_cache:
                 first_k = self.k_cache[0]
                 tokens_in_first = first_k.size(2)
 
-                if removed + tokens_in_first <= tokens_to_remove:
-                    # Remove entire first entry
-                    self.k_cache.pop(0)
-                    self.v_cache.pop(0)
-                    self.retention_scores.pop(0)
-                    self.positions.pop(0)
-                    removed += tokens_in_first
+                if compressed + tokens_in_first <= tokens_to_compress:
+                    # Compress entire first entry to tier2
+                    k_to_compress = self.k_cache.pop(0)
+                    v_to_compress = self.v_cache.pop(0)
+                    ret_to_compress = self.retention_scores.pop(0)
+                    pos_to_compress = self.positions.pop(0)
+
+                    # Compress with tier2_compression ratio
+                    k_comp, v_comp, pos_comp = self._compress(
+                        k_to_compress,
+                        v_to_compress,
+                        ret_to_compress,
+                        pos_to_compress,
+                        self.config.tier2_compression
+                    )
+
+                    self._tier2_k_cache.append(k_comp)
+                    self._tier2_v_cache.append(v_comp)
+                    self._tier2_positions.append(pos_comp)
+                    self._tier2_count += tokens_in_first
+
+                    compressed += tokens_in_first
                     self.total_tokens -= tokens_in_first
                 else:
-                    # Partial removal from first entry
-                    keep_tokens = tokens_in_first - (tokens_to_remove - removed)
-                    self.k_cache[0] = first_k[:, :, -keep_tokens:, :]
-                    self.v_cache[0] = self.v_cache[0][:, :, -keep_tokens:, :]
-                    self.retention_scores[0] = self.retention_scores[0][:, -keep_tokens:]
-                    self.positions[0] = self.positions[0][:, -keep_tokens:]
-                    self.total_tokens -= (tokens_to_remove - removed)
-                    removed = tokens_to_remove
+                    # Partial compression from first entry
+                    compress_tokens = tokens_to_compress - compressed
+                    keep_tokens = tokens_in_first - compress_tokens
+
+                    # Split the first entry
+                    k_compress_part = first_k[:, :, :compress_tokens, :]
+                    v_compress_part = self.v_cache[0][:, :, :compress_tokens, :]
+                    ret_compress_part = self.retention_scores[0][:, :compress_tokens]
+                    pos_compress_part = self.positions[0][:, :compress_tokens]
+
+                    # Keep the rest
+                    self.k_cache[0] = first_k[:, :, keep_tokens:, :]
+                    self.v_cache[0] = self.v_cache[0][:, :, keep_tokens:, :]
+                    self.retention_scores[0] = self.retention_scores[0][:, keep_tokens:]
+                    self.positions[0] = self.positions[0][:, keep_tokens:]
+
+                    # Compress the extracted part
+                    k_comp, v_comp, pos_comp = self._compress(
+                        k_compress_part,
+                        v_compress_part,
+                        ret_compress_part,
+                        pos_compress_part,
+                        self.config.tier2_compression
+                    )
+
+                    self._tier2_k_cache.append(k_comp)
+                    self._tier2_v_cache.append(v_comp)
+                    self._tier2_positions.append(pos_comp)
+                    self._tier2_count += compress_tokens
+
+                    self.total_tokens -= compress_tokens
+                    compressed = tokens_to_compress
 
         return True
 
