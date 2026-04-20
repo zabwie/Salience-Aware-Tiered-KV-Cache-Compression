@@ -1170,10 +1170,13 @@ class TieredKVCache:
         k_comp, _, _ = self.get_compressed_cache()
         compressed_len: int = k_comp.size(2) if k_comp is not None else 0
 
+        # Original token count includes both main cache and tier2 compressed tokens
+        original_tokens: int = self.total_tokens + self._tier2_count
+
         return CacheStats(
-            total_tokens=self.total_tokens,
+            total_tokens=original_tokens,
             compressed_tokens=compressed_len,
-            compression_ratio=self.total_tokens / max(compressed_len, 1),
+            compression_ratio=original_tokens / max(compressed_len, 1),
             tier_distribution=self._tier_counts,
             peak_memory_mb=self._get_peak_memory_mb(),
             compression_time_ms=self._compression_time_ms
