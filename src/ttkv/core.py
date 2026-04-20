@@ -55,6 +55,8 @@ class SalienceScorer(nn.Module):
 
     def __init__(self, hidden_dim: int = 768, salience_hidden: int = 256) -> None:
         super().__init__()
+        self.hidden_dim: int = hidden_dim
+        self.salience_hidden: int = salience_hidden
         self.net: nn.Sequential = nn.Sequential(
             nn.Linear(hidden_dim, salience_hidden),
             nn.ReLU(),
@@ -74,6 +76,73 @@ class SalienceScorer(nn.Module):
             Salience scores of shape [...]
         """
         return self.net(hidden_states).squeeze(-1)
+
+    def save_pretrained(self, path: str) -> None:
+        """Save scorer weights to disk.
+
+        Args:
+            path: Path to save the weights file
+        """
+        torch.save({
+            'hidden_dim': self.hidden_dim,
+            'salience_hidden': self.salience_hidden,
+            'state_dict': self.state_dict()
+        }, path)
+
+    def load_pretrained(self, path: str) -> None:
+        """Load pre-trained scorer weights from disk.
+
+        Args:
+            path: Path to the weights file
+
+        Raises:
+            FileNotFoundError: If the weights file doesn't exist
+            RuntimeError: If the weights are incompatible with this scorer
+        """
+        import os
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Pre-trained weights not found at {path}")
+
+        checkpoint: Dict[str, Any] = torch.load(path, map_location='cpu')
+
+        if checkpoint.get('hidden_dim') != self.hidden_dim:
+            raise RuntimeError(
+                f"Hidden dimension mismatch: model has {self.hidden_dim}, "
+                f"weights have {checkpoint.get('hidden_dim')}"
+            )
+        if checkpoint.get('salience_hidden') != self.salience_hidden:
+            raise RuntimeError(
+                f"Salience hidden dimension mismatch: model has {self.salience_hidden}, "
+                f"weights have {checkpoint.get('salience_hidden')}"
+            )
+
+        self.load_state_dict(checkpoint['state_dict'])
+
+    @classmethod
+    def from_pretrained(cls, path: str, **kwargs: Any) -> 'SalienceScorer':
+        """Create a SalienceScorer with pre-trained weights.
+
+        Args:
+            path: Path to the weights file
+            **kwargs: Additional arguments passed to __init__ (ignored if weights exist)
+
+        Returns:
+            SalienceScorer with loaded weights
+
+        Raises:
+            FileNotFoundError: If the weights file doesn't exist
+        """
+        import os
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Pre-trained weights not found at {path}")
+
+        checkpoint: Dict[str, Any] = torch.load(path, map_location='cpu')
+        hidden_dim = checkpoint.get('hidden_dim', kwargs.get('hidden_dim', 768))
+        salience_hidden = checkpoint.get('salience_hidden', kwargs.get('salience_hidden', 256))
+
+        scorer = cls(hidden_dim=hidden_dim, salience_hidden=salience_hidden)
+        scorer.load_state_dict(checkpoint['state_dict'])
+        return scorer
 
 
 class RetentionScheduler(nn.Module):
@@ -139,7 +208,22 @@ class TieredKVCache:
             v: Value tensor of shape [batch, heads, seq, head_dim]
             retention: Retention scores of shape [batch, seq]
             positions: Position indices of shape [batch, seq]
+
+        Raises:
+            ValueError: If tensor shapes are incompatible
         """
+        # Validate shapes
+        if k.shape != v.shape:
+            raise ValueError(f"Keys {k.shape} and values {v.shape} must have the same shape")
+        if retention.shape[0] != k.shape[0]:
+            raise ValueError(f"Batch size mismatch: keys have {k.shape[0]}, retention has {retention.shape[0]}")
+        if retention.shape[1] != k.shape[2]:
+            raise ValueError(f"Sequence length mismatch: keys have {k.shape[2]}, retention has {retention.shape[1]}")
+        if positions.shape != retention.shape:
+            raise ValueError(f"Positions {positions.shape} and retention {retention.shape} must have the same shape")
+        if k.dim() != 4:
+            raise ValueError(f"Keys must be 4D tensor [batch, heads, seq, head_dim], got {k.dim()}D")
+
         self.k_cache.append(k)
         self.v_cache.append(v)
         self.retention_scores.append(retention)
@@ -336,6 +420,8 @@ class TieredKVCache:
                   positions: torch.Tensor, ratio: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compress KV cache using weighted pooling based on retention scores.
 
+        Uses vectorized PyTorch operations for efficient GPU utilization.
+
         Args:
             k: Key tensor of shape [batch, heads, seq, head_dim]
             v: Value tensor of shape [batch, heads, seq, head_dim]
@@ -357,37 +443,28 @@ class TieredKVCache:
             return k, v, positions
 
         compressed_len: int = (seq_len + ratio - 1) // ratio
-        k_out: List[torch.Tensor] = []
-        v_out: List[torch.Tensor] = []
-        pos_out: List[torch.Tensor] = []
 
-        for b in range(batch_size):
-            k_batch: List[torch.Tensor] = []
-            v_batch: List[torch.Tensor] = []
-            pos_batch: List[torch.Tensor] = []
-            for i in range(compressed_len):
-                start: int = i * ratio
-                end: int = min((i + 1) * ratio, seq_len)
+        pad_len: int = compressed_len * ratio - seq_len
+        if pad_len > 0:
+            k = F.pad(k, (0, 0, 0, pad_len), value=0.0)
+            v = F.pad(v, (0, 0, 0, pad_len), value=0.0)
+            retention = F.pad(retention, (0, pad_len), value=float('-inf'))
+            positions = F.pad(positions, (0, pad_len), value=0)
 
-                k_chunk: torch.Tensor = k[b, :, start:end, :]
-                v_chunk: torch.Tensor = v[b, :, start:end, :]
-                ret_chunk: torch.Tensor = retention[b, start:end]
-                pos_chunk: torch.Tensor = positions[b, start:end]
+        k_reshaped: torch.Tensor = k.view(batch_size, num_heads, compressed_len, ratio, head_dim)
+        v_reshaped: torch.Tensor = v.view(batch_size, num_heads, compressed_len, ratio, head_dim)
+        ret_reshaped: torch.Tensor = retention.view(batch_size, compressed_len, ratio)
+        pos_reshaped: torch.Tensor = positions.view(batch_size, compressed_len, ratio)
 
-                weights: torch.Tensor = F.softmax(ret_chunk, dim=0).unsqueeze(0).unsqueeze(-1)
-                k_pooled: torch.Tensor = (k_chunk * weights).sum(dim=1)
-                v_pooled: torch.Tensor = (v_chunk * weights).sum(dim=1)
-                pos_pooled: torch.Tensor = (pos_chunk.float() * weights.squeeze()).sum().long()
+        weights: torch.Tensor = F.softmax(ret_reshaped, dim=-1)
+        weights_kv: torch.Tensor = weights.unsqueeze(1).unsqueeze(-1)
 
-                k_batch.append(k_pooled)
-                v_batch.append(v_pooled)
-                pos_batch.append(pos_pooled)
+        k_pooled: torch.Tensor = (k_reshaped * weights_kv).sum(dim=3)
+        v_pooled: torch.Tensor = (v_reshaped * weights_kv).sum(dim=3)
 
-            k_out.append(torch.stack(k_batch, dim=1))
-            v_out.append(torch.stack(v_batch, dim=1))
-            pos_out.append(torch.stack(pos_batch))
+        pos_pooled: torch.Tensor = (pos_reshaped.float() * weights).sum(dim=-1).long()
 
-        return torch.stack(k_out, dim=0), torch.stack(v_out, dim=0), torch.stack(pos_out, dim=0)
+        return k_pooled, v_pooled, pos_pooled
 
     def get_stats(self) -> Dict[str, Any]:
         """Get compression statistics.
