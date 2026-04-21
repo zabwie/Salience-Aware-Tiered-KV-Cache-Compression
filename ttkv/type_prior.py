@@ -1,21 +1,14 @@
 """Mock type prior without spaCy dependency."""
 
 import torch
-from typing import List, Dict, Optional
+from typing import List, Dict
 import re
 
 
 class MockTypePriorClassifier:
-    """Rule-based token classifier for type-based retention scoring.
 
-    Classifies tokens into categories (NAMED_ENTITY, NUMERIC, etc.) and assigns
-    retention priorities based on linguistic patterns without requiring spaCy.
-
-    This is a lightweight fallback when spaCy is not available.
-    """
-
-    def __init__(self) -> None:
-        self.patterns: Dict[str, List[str]] = {
+    def __init__(self):
+        self.patterns = {
             'NAMED_ENTITY': [
                 r'[A-Z][a-z]+\s+[A-Z][a-z]+',
                 r'[A-Z]{2,}',
@@ -34,7 +27,7 @@ class MockTypePriorClassifier:
             ],
         }
 
-        self.retention_map: Dict[str, float] = {
+        self.retention_map = {
             'NAMED_ENTITY': 1.0,
             'NUMERIC': 1.0,
             'PUNCTUATION': 0.05,
@@ -42,20 +35,12 @@ class MockTypePriorClassifier:
             'CONTENT_WORD': 0.3,
         }
 
-    def classify_tokens(self, tokens: List[str]) -> Dict[int, float]:
-        """Classify tokens and return retention scores.
-
-        Args:
-            tokens: List of token strings
-
-        Returns:
-            Dictionary mapping token indices to retention scores
-        """
-        retention_scores: Dict[int, float] = {}
+    def classify_tokens(self, tokens: List[str]) -> Dict[str, float]:
+        retention_scores = {}
 
         for i, token in enumerate(tokens):
-            token_lower: str = token.lower()
-            matched: bool = False
+            token_lower = token.lower()
+            matched = False
 
             if re.match(r'^[A-Z]', token) and len(token) > 1:
                 retention_scores[i] = self.retention_map['NAMED_ENTITY']
@@ -75,25 +60,13 @@ class MockTypePriorClassifier:
 
         return retention_scores
 
-    def get_retention_tensor(self, token_ids: torch.Tensor,
-                              vocab_mapping: Optional[Dict[int, str]] = None) -> torch.Tensor:
-        """Get retention scores as a tensor.
-
-        Args:
-            token_ids: Token IDs of shape [batch, seq_len]
-            vocab_mapping: Optional mapping from token IDs to strings
-
-        Returns:
-            Retention scores tensor of shape [batch, seq_len]
-        """
-        batch_size: int
-        seq_len: int
+    def get_retention_tensor(self, token_ids: torch.Tensor, vocab_mapping: Dict[int, str] = None) -> torch.Tensor:
         batch_size, seq_len = token_ids.shape
-        retention: torch.Tensor = torch.full((batch_size, seq_len), 0.3)
+        retention = torch.full((batch_size, seq_len), 0.3)
 
         if vocab_mapping is None:
             for b in range(batch_size):
-                important_positions: set = set(range(0, seq_len // 10)) | set(range(seq_len * 9 // 10, seq_len))
+                important_positions = set(range(0, seq_len // 10)) | set(range(seq_len * 9 // 10, seq_len))
                 for i in range(seq_len):
                     if i in important_positions:
                         retention[b, i] = 0.9
@@ -101,9 +74,9 @@ class MockTypePriorClassifier:
                         retention[b, i] = 0.7
         else:
             for b in range(batch_size):
-                tokens: List[str] = [vocab_mapping.get(int(token_ids[b, i]), f"token_{token_ids[b, i]}")
-                                     for i in range(seq_len)]
-                scores: Dict[int, float] = self.classify_tokens(tokens)
+                tokens = [vocab_mapping.get(int(token_ids[b, i]), f"token_{token_ids[b, i]}")
+                        for i in range(seq_len)]
+                scores = self.classify_tokens(tokens)
                 for i, score in scores.items():
                     retention[b, i] = score
 
@@ -111,23 +84,13 @@ class MockTypePriorClassifier:
 
 
 def create_mock_retention(seq_len: int, num_named_entities: int = 20,
-                          num_numbers: int = 10) -> torch.Tensor:
-    """Create mock retention scores with simulated named entities and numbers.
+                         num_numbers: int = 10) -> torch.Tensor:
+    retention = torch.full((1, seq_len), 0.3)
 
-    Args:
-        seq_len: Sequence length
-        num_named_entities: Number of named entity positions
-        num_numbers: Number of numeric positions
-
-    Returns:
-        Retention scores tensor of shape [1, seq_len]
-    """
-    retention: torch.Tensor = torch.full((1, seq_len), 0.3)
-
-    ne_positions: torch.Tensor = torch.randperm(seq_len)[:num_named_entities]
+    ne_positions = torch.randperm(seq_len)[:num_named_entities]
     retention[0, ne_positions] = 1.0
 
-    num_positions: torch.Tensor = torch.randperm(seq_len)[:num_numbers]
+    num_positions = torch.randperm(seq_len)[:num_numbers]
     retention[0, num_positions] = 1.0
 
     retention[0, :seq_len//20] = 0.9
@@ -141,30 +104,19 @@ def create_mock_retention(seq_len: int, num_named_entities: int = 20,
 
 
 def compute_type_prior_retention(token_ids: torch.Tensor,
-                                  alpha: float = 0.0) -> torch.Tensor:
-    """Compute type-prior based retention scores.
-
-    Args:
-        token_ids: Token IDs of shape [batch, seq_len]
-        alpha: Weighting parameter (unused, kept for API compatibility)
-
-    Returns:
-        Retention scores tensor of shape [batch, seq_len]
-    """
-    batch_size: int
-    seq_len: int
+                                alpha: float = 0.0) -> torch.Tensor:
     batch_size, seq_len = token_ids.shape
 
-    retention: torch.Tensor = create_mock_retention(seq_len)
+    retention = create_mock_retention(seq_len)
     retention = retention.repeat(batch_size, 1)
 
     return retention
 
 
 if __name__ == "__main__":
-    seq_len: int = 100
-    token_ids: torch.Tensor = torch.randint(0, 50000, (1, seq_len))
-    retention: torch.Tensor = compute_type_prior_retention(token_ids)
+    seq_len = 100
+    token_ids = torch.randint(0, 50000, (1, seq_len))
+    retention = compute_type_prior_retention(token_ids)
 
     print(f"Created retention scores for {seq_len} tokens")
     print(f"Stats: min={retention.min():.2f}, max={retention.max():.2f}, mean={retention.mean():.2f}")

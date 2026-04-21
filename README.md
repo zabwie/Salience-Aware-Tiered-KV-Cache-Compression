@@ -81,9 +81,7 @@ Quality: <0.2% perplexity increase at 7.36x compression on GPT-2.
 
 - [Paper](paper/main.tex) - Full technical details
 - [API Reference](#api-reference) - Below
-- [Examples](examples/) - Simple demos and usage examples
-- [Tests](tests/) - Comprehensive test suite and experiments
-- [Recommendations](RECOMMENDATIONS.md) - Future improvements and roadmap
+- [Examples](tests/) - Test scripts and experiments
 
 ## API Reference
 
@@ -148,37 +146,12 @@ ttkv/
 │   ├── attention_scorer.py  # Attention-guided scoring
 │   └── type_prior.py        # Structural priors
 ├── tests/
-│   ├── core/                # Core functionality tests
-│   ├── integration/         # End-to-end integration tests
-│   └── experiments/         # Paper experiments
-├── .github/
-│   └── workflows/           # CI/CD automation
+│   ├── core/               # Core functionality tests
+│   └── experiments/        # Paper experiments
 ├── paper/
-│   └── main.tex             # LaTeX source
-├── CONTRIBUTING.md          # Contribution guidelines
-├── CHANGELOG.md             # Version history
-└── README.md                # This file
+│   └── main.tex            # LaTeX source
+└── README.md               # This file
 ```
-
-## Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for:
-- Development setup instructions
-- Code style guidelines (Black, Flake8, mypy)
-- Testing requirements
-- Pull request process
-
-## CI/CD
-
-This project uses GitHub Actions for continuous integration:
-
-- **Automated Testing**: Runs on every push and PR (Python 3.9-3.12)
-- **Code Quality**: Black formatting, Flake8 linting, mypy type checking
-- **Integration Tests**: Full end-to-end model integration tests
-- **Benchmarks**: Performance regression testing
-- **PyPI Publishing**: Automated on releases
-
-[![CI Status](https://github.com/zabwie/ttkv/workflows/Tests/badge.svg)](https://github.com/zabwie/ttkv/actions)
 
 ## Citation
 
